@@ -33,6 +33,7 @@ enum Role {
 
 enum UserStatus {
   ACTIVE
+  PENDING
   SUSPENDED
   BANNED
 }
@@ -86,6 +87,7 @@ enum SupportSessionState {
 }
 
 enum SupportTaskState {
+  PENDING
   IN_PROGRESS
   SATISFIED
   FAILED
@@ -106,11 +108,13 @@ enum VerificationResult {
   PASSED
   FAILED
   INCONCLUSIVE
+  PENDING
 }
 
 /// Whether the reward for a session has been paid, held for review, or clawed back.
 enum RewardState {
-  NONE_REVIEW
+  NONE
+  PENDING_REVIEW
   CONFIRMED
   DENIED
   REVERSED
@@ -167,9 +171,9 @@ enum AbuseSignalType {
   SELF_SUPPORT_ATTEMPT
   REFERRAL_ABUSE
   DUPLICATE_DEVICE
-  ACCOUNT_TOO_NEW
   SUBSCRIPTION_CHURN
   CLIENT_TAMPERING
+  ACCOUNT_TOO_NEW
 }
 
 /// Lifecycle of a YouTube OAuth grant. An explicit state is what stops the app
@@ -218,6 +222,7 @@ enum NotificationType {
 }
 
 enum DeliveryStatus {
+  PENDING
   SENT
   FAILED
   READ
