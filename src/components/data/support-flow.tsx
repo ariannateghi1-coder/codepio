@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { CheckCircle2, ExternalLink, Link2, RefreshCw, ShieldAlert, TrendingUp } from "lucide-react";
+import { CheckCircle2, ExternalLink, Link2, PlayCircle, RefreshCw, ShieldAlert, TrendingUp } from "lucide-react";
 import { api, errorMessage } from "@/lib/client-api";
 import { Modal } from "@/components/ui/modal";
 import { Button } from "@/components/ui/button";
@@ -9,19 +9,33 @@ import { Alert } from "@/components/ui/states";
 import { ProgressBar, Steps, type Step } from "@/components/ui/progress";
 import { Pill, VerificationBadge } from "@/components/ui/badge";
 import { formatDuration, formatNumber } from "@/lib/cn";
-import { SUPPORT_TRANSFER_CREDITS, WATCH_RULES } from "@/lib/gamification";
+import { SUPPORT_TRANSFER_CREDITS } from "@/lib/gamification";
+import { youtubeAppUrl } from "@/lib/youtube";
 
 /**
  * Support session flow — a guided, five-stage experience.
  *
  *   1 تماشا → 2 سابسکرایب → 3 لایک → 4 کامنت (اختیاری) → 5 ثبت
  *
+ * WATCH STAGE — the video is watched ON YOUTUBE, not here:
+ *
+ *   Pressing «تماشا در یوتیوب» tells the server "I am opening it now", and the
+ *   server stamps an anchor. On mobile the YouTube app is attempted first via the
+ *   `vnd.youtube:` scheme with the https URL as fallback; on desktop the canonical
+ *   watch URL opens in a new tab. There is no iframe and no Player API, which is
+ *   why the embed and the heartbeat loop are gone.
+ *
+ *   The countdown shown here is cosmetic: it ticks locally for feedback, but the
+ *   only value that decides anything is what the server returns from its own
+ *   clock. The client sends no elapsed time — it cannot, the request body is just
+ *   the session id — so nothing displayed here can be forged into a reward.
+ *
  * The honest verification model, made visible at every step:
  *
- *   Watch     — tracked by us from IFrame Player events, credited server-side from
- *               the union of segments actually played. Labelled «ثبت‌شده توسط
- *               پلتفرم», never «تأییدشده توسط یوتیوب», because no YouTube API
- *               reports how much of a video a specific person watched.
+ *   Watch     — «ثبت‌شده توسط پلتفرم»: the required time elapsed after we sent you
+ *               to YouTube. Never «تأییدشده توسط یوتیوب», because no YouTube API
+ *               reports how much of a video a specific person watched, and with the
+ *               player outside the page we observe even less than before.
  *   Subscribe — checked through the YouTube Data API with the user's own OAuth
  *               grant. Without that grant we say so and block the task rather than
  *               asking "did you subscribe?" and believing the answer.
@@ -29,14 +43,10 @@ import { SUPPORT_TRANSFER_CREDITS, WATCH_RULES } from "@/lib/gamification";
  *   Comment   — optional; matched against the linked channel when possible. It can
  *               never block completion.
  *
- * The client only reports player positions and a monotonic sequence number. The
- * server decides what they are worth, so seeking to 90% credits nothing.
- *
  * Feedback rules:
  *  • Every task shows a real state. There is no indefinite spinner: a task is
  *    done, pending, failed-with-a-reason, or blocked-with-an-action.
- *  • A failure says what to do next ("کانال را سابسکرایب کنید و دوباره بررسی
- *    بزنید"), never a status code. Technical detail stays in the server log.
+ *  • A failure says what to do next, never a status code.
  *  • A temporary YouTube outage is shown as temporary, and does not mark the task
  *    failed — the server keeps it pending for exactly this reason.
  *  • The reward shown is the reward the server will pay, itemised after settlement.
@@ -46,13 +56,26 @@ type SessionInfo = {
   sessionId: string;
   state: string;
   expiresAt: string;
-  video: { id: string; youtubeVideoId: string; durationSec: number | null; embedUrl: string };
+  video: { id: string; youtubeVideoId: string; durationSec: number | null; watchUrl: string };
   requiredWatchSeconds: number;
+  openedAt: string | null;
+  remainingSeconds: number;
   estimatedSeconds: number;
-  heartbeatSeconds?: number;
   tasks: { type: string; required: boolean; rewardXp: number; verifiable: string }[];
   youtubeConnected: boolean;
   youtubeState?: string;
+};
+
+/** Server's view of the watch timer. Every field here is computed server-side. */
+type WatchTimer = {
+  watchUrl: string;
+  requiredSec: number;
+  remainingSec: number;
+  elapsedSec: number;
+  percent: number;
+  satisfied: boolean;
+  openedAt: string;
+  state: string;
 };
 
 type TaskOutcome = "VERIFIED" | "NOT_VERIFIED" | "TEMPORARY_ERROR" | "REAUTH_REQUIRED" | "UNAVAILABLE";
@@ -80,39 +103,49 @@ const TASK_LABELS: Record<string, string> = {
   COMMENT_VIDEO: "کامنت (اختیاری)",
 };
 
-/** Minimal typing for the parts of the YouTube IFrame API we use. */
-type YTPlayer = {
-  getCurrentTime: () => number;
-  getPlayerState: () => number;
-  destroy: () => void;
-};
-
-declare global {
-  interface Window {
-    YT?: {
-      Player: new (element: HTMLElement, options: Record<string, unknown>) => YTPlayer;
-      PlayerState: { PLAYING: number; PAUSED: number; BUFFERING: number; ENDED: number };
-    };
-    onYouTubeIframeAPIReady?: () => void;
+/** «۳ دقیقه و ۲۰ ثانیه» — Persian digits via the shared formatter. */
+function formatRemaining(totalSeconds: number): string {
+  const s = Math.max(0, Math.round(totalSeconds));
+  const minutes = Math.floor(s / 60);
+  const seconds = s % 60;
+  if (minutes > 0 && seconds > 0) {
+    return `${formatNumber(minutes)} دقیقه و ${formatNumber(seconds)} ثانیه`;
   }
+  if (minutes > 0) return `${formatNumber(minutes)} دقیقه`;
+  return `${formatNumber(seconds)} ثانیه`;
 }
 
-function loadIframeApi(): Promise<void> {
-  if (window.YT?.Player) return Promise.resolve();
-  return new Promise((resolve) => {
-    const existing = document.getElementById("youtube-iframe-api");
-    if (!existing) {
-      const script = document.createElement("script");
-      script.id = "youtube-iframe-api";
-      script.src = "https://www.youtube.com/iframe_api";
-      document.head.appendChild(script);
-    }
-    const previous = window.onYouTubeIframeAPIReady;
-    window.onYouTubeIframeAPIReady = () => {
-      previous?.();
-      resolve();
-    };
-  });
+/**
+ * Opens the video, preferring the YouTube app on mobile.
+ *
+ * The app scheme is attempted in a hidden way first and the https URL follows as a
+ * fallback, because there is no reliable way to ask a browser "is this scheme
+ * handled?" — if the app takes over, the page is already backgrounded when the
+ * fallback fires and the browser ignores it. On desktop the scheme would do
+ * nothing, so the https URL is used directly in a new tab.
+ */
+function openOnYoutube(watchUrl: string, videoId: string) {
+  const isMobile = /android|iphone|ipad|ipod/i.test(navigator.userAgent);
+
+  if (!isMobile) {
+    window.open(watchUrl, "_blank", "noopener,noreferrer");
+    return;
+  }
+
+  // rel=noopener matters even here: the opened context must not get a handle on
+  // this window object.
+  const fallback = window.setTimeout(() => {
+    window.open(watchUrl, "_blank", "noopener,noreferrer");
+  }, 700);
+
+  // If the app takes over, the page is hidden before the timeout fires.
+  const onHide = () => {
+    if (document.hidden) window.clearTimeout(fallback);
+    document.removeEventListener("visibilitychange", onHide);
+  };
+  document.addEventListener("visibilitychange", onHide);
+
+  window.location.href = youtubeAppUrl(videoId);
 }
 
 export function SupportFlow({
@@ -129,45 +162,24 @@ export function SupportFlow({
   const [session, setSession] = useState<SessionInfo | null>(null);
   const [error, setError] = useState("");
   const [starting, setStarting] = useState(false);
-  const [watch, setWatch] = useState({ percent: 0, accumulatedSec: 0, requiredSec: 0, satisfied: false });
+  const [timer, setTimer] = useState<WatchTimer | null>(null);
+  const [opening, setOpening] = useState(false);
+  const [checking, setChecking] = useState(false);
+  /** Local countdown for feedback only; the server's value always overrides it. */
+  const [localRemaining, setLocalRemaining] = useState<number | null>(null);
   const [verification, setVerification] = useState<Verification | null>(null);
   const [verifying, setVerifying] = useState(false);
   const [completion, setCompletion] = useState<Completion | null>(null);
   const [completing, setCompleting] = useState(false);
-  const [heartbeatStatus, setHeartbeatStatus] = useState<"online" | "degraded" | "recovered">("online");
-  const [heartbeatFailures, setHeartbeatFailures] = useState(0);
 
-  const playerRef = useRef<YTPlayer | null>(null);
-  const mountRef = useRef<HTMLDivElement>(null);
-  const heartbeatRef = useRef<number | null>(null);
-  // Monotonic sequence, so the server can reject replayed/out-of-order beats.
-  const sequenceRef = useRef(0);
-  // Accumulated hidden time since the last beat (Page Visibility API).
-  const hiddenSinceRef = useRef<number | null>(null);
-  const hiddenAccumulatedRef = useRef(0);
+  const tickRef = useRef<number | null>(null);
 
-  const stopHeartbeat = useCallback(() => {
-    if (heartbeatRef.current !== null) {
-      window.clearInterval(heartbeatRef.current);
-      heartbeatRef.current = null;
+  const stopTick = useCallback(() => {
+    if (tickRef.current !== null) {
+      window.clearInterval(tickRef.current);
+      tickRef.current = null;
     }
   }, []);
-
-  // Track background time honestly. A hostile client could simply not report it,
-  // which is why the server treats it as a trust signal and not as proof.
-  useEffect(() => {
-    if (!open) return;
-    function onVisibility() {
-      if (document.hidden) {
-        hiddenSinceRef.current = Date.now();
-      } else if (hiddenSinceRef.current !== null) {
-        hiddenAccumulatedRef.current += (Date.now() - hiddenSinceRef.current) / 1000;
-        hiddenSinceRef.current = null;
-      }
-    }
-    document.addEventListener("visibilitychange", onVisibility);
-    return () => document.removeEventListener("visibilitychange", onVisibility);
-  }, [open]);
 
   // Start the session as soon as the modal opens with a campaign.
   useEffect(() => {
@@ -178,17 +190,20 @@ export function SupportFlow({
     setError("");
     setCompletion(null);
     setVerification(null);
-    setHeartbeatStatus("online");
-    setHeartbeatFailures(0);
-    sequenceRef.current = 0;
-    hiddenAccumulatedRef.current = 0;
+    setTimer(null);
+    setLocalRemaining(null);
 
     api
       .post<SessionInfo>("/api/v1/support/sessions", { campaignId })
       .then((data) => {
         if (cancelled) return;
         setSession(data);
-        setWatch({ percent: 0, accumulatedSec: 0, requiredSec: data.requiredWatchSeconds, satisfied: false });
+        // Re-entering an already-open session must show the time already served,
+        // not a fresh countdown: the anchor lives on the server, so it is reused.
+        if (data.openedAt) {
+          setLocalRemaining(data.remainingSeconds);
+          void refreshTimer(data.sessionId, { silent: true });
+        }
       })
       .catch((e) => {
         if (!cancelled) setError(errorMessage(e));
@@ -200,100 +215,80 @@ export function SupportFlow({
     return () => {
       cancelled = true;
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, campaignId]);
 
-  // Mount the player and begin heartbeats. The interval is the server's expected
-  // cadence; the server independently measures the wall time between beats.
+  // Cosmetic countdown. It never decides anything — when it reaches zero the
+  // server is asked, and the server's answer replaces whatever this showed.
+  //
+  // The effect depends on WHETHER a countdown should run, not on the current
+  // value: depending on `localRemaining` itself would tear down and recreate the
+  // interval every second.
+  const shouldTick = open && localRemaining !== null && localRemaining > 0;
   useEffect(() => {
-    if (!session || !open || !mountRef.current) return;
-    let destroyed = false;
-    const cadence = session.heartbeatSeconds ?? WATCH_RULES.heartbeatSeconds;
+    if (!shouldTick) {
+      stopTick();
+      return;
+    }
+    tickRef.current = window.setInterval(() => {
+      setLocalRemaining((value) => (value === null ? null : Math.max(0, value - 1)));
+    }, 1000);
+    return stopTick;
+  }, [shouldTick, stopTick]);
 
-    loadIframeApi().then(() => {
-      if (destroyed || !mountRef.current || !window.YT?.Player) return;
+  // When the local countdown hits zero, confirm with the server once.
+  useEffect(() => {
+    if (!session || localRemaining !== 0 || timer?.satisfied) return;
+    void refreshTimer(session.sessionId, { silent: true });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [localRemaining, session?.sessionId, timer?.satisfied]);
 
-      playerRef.current = new window.YT.Player(mountRef.current, {
-        videoId: session.video.youtubeVideoId,
-        host: "https://www.youtube-nocookie.com",
-        playerVars: { rel: 0, modestbranding: 1, playsinline: 1, enablejsapi: 1, origin: window.location.origin },
-        events: {
-          onStateChange: () => void sendHeartbeat(),
-        },
-      });
-
-      heartbeatRef.current = window.setInterval(() => void sendHeartbeat(), cadence * 1000);
-    });
-
-    async function sendHeartbeat() {
-      const player = playerRef.current;
-      if (!player || !session) return;
-
-      const states = window.YT?.PlayerState;
-      const raw = player.getPlayerState?.();
-      const playerState =
-        raw === states?.PLAYING
-          ? "PLAYING"
-          : raw === states?.PAUSED
-            ? "PAUSED"
-            : raw === states?.BUFFERING
-              ? "BUFFERING"
-              : raw === states?.ENDED
-                ? "ENDED"
-                : "IDLE";
-
-      // Fold in any time spent hidden while still counting the current stretch.
-      let hidden = hiddenAccumulatedRef.current;
-      if (hiddenSinceRef.current !== null) hidden += (Date.now() - hiddenSinceRef.current) / 1000;
-      hiddenAccumulatedRef.current = 0;
-      if (hiddenSinceRef.current !== null) hiddenSinceRef.current = Date.now();
-
-      sequenceRef.current += 1;
-
-      try {
-        const result = await api.post<{
-          accumulatedSec: number;
-          requiredSec: number;
-          percent: number;
-          satisfied: boolean;
-          rejected: boolean;
-          acceptedSequence: number;
-        }>("/api/v1/support/heartbeat", {
-          sessionId: session.sessionId,
-          position: Math.floor(player.getCurrentTime?.() ?? 0),
-          playerState,
-          sequence: sequenceRef.current,
-          hiddenSec: Math.round(hidden),
-        });
-        // Resynchronise with the server's view, so a rejected beat cannot leave
-        // the client permanently out of step.
-        sequenceRef.current = Math.max(sequenceRef.current, result.acceptedSequence);
-        setHeartbeatFailures((failures) => {
-          if (failures > 0) setHeartbeatStatus("recovered");
-          return 0;
-        });
-        if (!result.rejected) {
-          setWatch({
-            accumulatedSec: result.accumulatedSec,
-            requiredSec: result.requiredSec,
-            percent: result.percent,
-            satisfied: result.satisfied,
-          });
-        }
-      } catch {
-        // Keep the support state machine untouched, but make the accounting gap
-        // visible: the next scheduled beat retries automatically.
-        setHeartbeatFailures((failures) => failures + 1);
-        setHeartbeatStatus("degraded");
+  // Coming back from the YouTube app/tab is the natural moment to re-check.
+  useEffect(() => {
+    if (!open || !session) return;
+    function onVisibility() {
+      if (!document.hidden && session && !timer?.satisfied) {
+        void refreshTimer(session.sessionId, { silent: true });
       }
     }
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => document.removeEventListener("visibilitychange", onVisibility);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, session?.sessionId, timer?.satisfied]);
 
-    return () => {
-      destroyed = true;
-      stopHeartbeat();
-      playerRef.current?.destroy?.();
-      playerRef.current = null;
-    };
-  }, [session, open, stopHeartbeat]);
+  function applyTimer(result: WatchTimer) {
+    setTimer(result);
+    setLocalRemaining(result.remainingSec);
+  }
+
+  /** PATCH = "how long is left?". Server recomputes from its anchor. */
+  async function refreshTimer(sessionId: string, opts?: { silent?: boolean }) {
+    if (!opts?.silent) setChecking(true);
+    try {
+      applyTimer(await api.patch<WatchTimer>("/api/v1/support/watch", { sessionId }));
+    } catch (e) {
+      // A silent poll must not spray errors over the UI; the explicit button does.
+      if (!opts?.silent) setError(errorMessage(e));
+    } finally {
+      if (!opts?.silent) setChecking(false);
+    }
+  }
+
+  /** POST = "I am opening it now": stamps the anchor, then opens YouTube. */
+  async function openVideo() {
+    if (!session) return;
+    setOpening(true);
+    setError("");
+    try {
+      const result = await api.post<WatchTimer>("/api/v1/support/watch", { sessionId: session.sessionId });
+      applyTimer(result);
+      openOnYoutube(result.watchUrl, session.video.youtubeVideoId);
+    } catch (e) {
+      setError(errorMessage(e));
+    } finally {
+      setOpening(false);
+    }
+  }
 
   async function runVerification() {
     if (!session) return;
@@ -315,7 +310,7 @@ export function SupportFlow({
     try {
       const result = await api.post<Completion>("/api/v1/support/complete", { sessionId: session.sessionId });
       setCompletion(result);
-      stopHeartbeat();
+      stopTick();
       onCompleted?.();
     } catch (e) {
       setError(errorMessage(e));
@@ -325,10 +320,12 @@ export function SupportFlow({
   }
 
   function close() {
-    stopHeartbeat();
+    stopTick();
     setSession(null);
     setVerification(null);
     setCompletion(null);
+    setTimer(null);
+    setLocalRemaining(null);
     setError("");
     onClose();
   }
@@ -348,11 +345,18 @@ export function SupportFlow({
       }
     : { credits: 0, xp: 0 };
 
+  const watchSatisfied = Boolean(timer?.satisfied);
+  const watchOpened = Boolean(timer?.openedAt ?? session?.openedAt);
+  const requiredSec = timer?.requiredSec ?? session?.requiredWatchSeconds ?? 0;
+  // Prefer the server's number; fall back to the local tick between polls.
+  const remainingSec = watchSatisfied ? 0 : (localRemaining ?? timer?.remainingSec ?? requiredSec);
+  const elapsedSec = Math.max(0, requiredSec - remainingSec);
+
   const steps: Step[] = session
     ? session.tasks.map((task) => {
         const result = verification?.tasks.find((t) => t.type === task.type);
         const isWatch = task.type === "WATCH_VIDEO";
-        const satisfied = isWatch ? watch.satisfied : Boolean(result?.satisfied);
+        const satisfied = isWatch ? watchSatisfied : Boolean(result?.satisfied);
 
         // A temporary upstream failure is "still pending", not "failed" — the
         // server keeps the task open, and the UI must say the same thing.
@@ -362,17 +366,23 @@ export function SupportFlow({
           ? "completed"
           : pending
             ? "current"
-            : result && !result.satisfied
-              ? "failed"
-              : isWatch && watch.percent > 0
+            : isWatch
+              ? watchOpened
                 ? "current"
+                : "upcoming"
+              : result && !result.satisfied
+                ? "failed"
                 : "upcoming";
 
         return {
           label: TASK_LABELS[task.type] ?? task.type,
           state,
           detail: isWatch
-            ? `${formatNumber(watch.percent)}٪ از ${formatDuration(session.video.durationSec ?? 0)} — نیاز: ${formatDuration(watch.requiredSec)}`
+            ? watchSatisfied
+              ? "زمان لازم سپری شد."
+              : watchOpened
+                ? `حدود ${formatRemaining(remainingSec)} تا تأیید باقی مانده.`
+                : `${formatDuration(requiredSec)} از ${formatDuration(session.video.durationSec ?? 0)} — برای شروع، ویدیو را در یوتیوب باز کنید.`
             : (result?.note ??
               (task.verifiable === "REQUIRES_YOUTUBE_CONNECTION"
                 ? "برای بررسی خودکار، حساب یوتیوب را متصل کنید."
@@ -391,7 +401,7 @@ export function SupportFlow({
       open={open}
       onClose={close}
       title={completion ? "نتیجه حمایت" : "حمایت واقعی"}
-      description={completion ? undefined : "کارهای زیر پس از انجام، سمت سرور بررسی می‌شوند."}
+      description={completion ? undefined : "ویدیو را در یوتیوب تماشا کنید؛ بررسی نهایی سمت سرور انجام می‌شود."}
       footer={
         completion ? (
           <Button onClick={close}>بستن</Button>
@@ -416,16 +426,56 @@ export function SupportFlow({
         </Alert>
       )}
 
-      {starting && <div className="skeleton aspect-video w-full rounded-lg" />}
+      {starting && <div className="skeleton h-24 w-full rounded-lg" />}
 
       {completion ? (
         <CompletionSummary completion={completion} />
       ) : (
         session && (
           <div className="space-y-4">
-            <div className="overflow-hidden rounded-lg bg-black">
-              {/* youtube-nocookie only, matching the CSP frame-src allow-list. */}
-              <div ref={mountRef} className="aspect-video w-full" />
+            {/* The watch target. No iframe: the video is opened on YouTube. */}
+            <div className="rounded-lg border border-border p-4">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <p className="text-sm font-bold">{session.video.durationSec ? formatDuration(session.video.durationSec) : "—"}</p>
+                  <p className="mt-1 text-xs text-fg-muted">
+                    زمان لازم: <span className="numeric font-bold">{formatDuration(requiredSec)}</span>
+                  </p>
+                </div>
+                <Button
+                  onClick={openVideo}
+                  loading={opening}
+                  disabled={watchSatisfied}
+                  icon={<PlayCircle aria-hidden size={16} />}
+                >
+                  {watchOpened ? "باز کردن دوباره در یوتیوب" : "تماشا در یوتیوب"}
+                </Button>
+              </div>
+
+              {watchOpened && (
+                <div className="mt-4 space-y-2">
+                  <ProgressBar
+                    label="پیشرفت زمان تماشا"
+                    value={elapsedSec}
+                    max={Math.max(1, requiredSec)}
+                    tone={watchSatisfied ? "success" : "accent"}
+                  />
+                  <p className="numeric text-xs text-fg-muted" role="status" aria-live="polite">
+                    {watchSatisfied
+                      ? "زمان لازم سپری شد؛ اکنون «بررسی وضعیت» را بزنید."
+                      : `حدود ${formatRemaining(remainingSec)} تا تأیید باقی مانده.`}
+                  </p>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => void refreshTimer(session.sessionId)}
+                    loading={checking}
+                    icon={<RefreshCw aria-hidden size={14} />}
+                  >
+                    بررسی زمان
+                  </Button>
+                </div>
+              )}
             </div>
 
             {/* Live reward, stated before anything is committed. */}
@@ -435,24 +485,6 @@ export function SupportFlow({
                 +{formatNumber(liveReward.credits)} اعتبار{liveReward.xp > 0 ? ` · +${formatNumber(liveReward.xp)} XP` : ""}
               </span>
             </div>
-
-            <ProgressBar
-              label="پیشرفت تماشا"
-              value={watch.accumulatedSec}
-              max={Math.max(1, watch.requiredSec)}
-              tone={watch.satisfied ? "success" : "accent"}
-            />
-
-            {heartbeatStatus === "degraded" && (
-              <Alert tone="warning" live="status" title="ارتباط ثبت تماشا قطع شده است">
-                تلاش برای اتصال دوباره ادامه دارد ({formatNumber(heartbeatFailures)} تلاش ناموفق). تا بازیابی ارتباط، بخشی از زمان تماشا ممکن است ثبت و اعتباردهی نشود.
-              </Alert>
-            )}
-            {heartbeatStatus === "recovered" && (
-              <Alert tone="success" live="status" title="ارتباط ثبت تماشا بازیابی شد">
-                ثبت تماشا دوباره فعال است. زمانِ هنگام قطعی ممکن است اعتباردهی نشده باشد؛ پیشرفت نمایش‌داده‌شده، مقدار تأییدشده سرور است.
-              </Alert>
-            )}
 
             {reauthNeeded ? (
               <Alert tone="warning" title="اتصال یوتیوب باید تازه شود">
@@ -488,13 +520,15 @@ export function SupportFlow({
               <span className="text-fg-subtle">سابسکرایب و لایک</span>
             </div>
 
+            {/* Stated plainly, because the alternative is implying YouTube told us. */}
             <p className="flex items-start gap-2 text-xs leading-6 text-fg-subtle">
               <ShieldAlert aria-hidden size={14} className="mt-1 shrink-0" />
-              جابه‌جایی سریع در تایم‌لاین به‌عنوان تماشا حساب نمی‌شود؛ فقط بخش‌هایی که واقعاً پخش شده‌اند شمارش می‌شوند. حداکثر سرعت قابل قبول ۱٫۲۵× است.
+              زمان تماشا از لحظه‌ای که ویدیو را باز می‌کنید، روی ساعت سرور اندازه‌گیری می‌شود. یوتیوب میزان تماشای شما را به ما گزارش نمی‌دهد،
+              بنابراین این مورد «ثبت‌شده توسط پلتفرم» است و نه «تأییدشده توسط یوتیوب».
             </p>
 
             <a
-              href={`https://www.youtube.com/watch?v=${session.video.youtubeVideoId}`}
+              href={session.video.watchUrl}
               target="_blank"
               rel="noopener noreferrer"
               className="inline-flex items-center gap-1 text-xs font-semibold text-accent"

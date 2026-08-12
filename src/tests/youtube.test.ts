@@ -6,7 +6,7 @@ import {
   isValidYoutubeChannelId,
   isValidYoutubeVideoId,
   parseIsoDuration,
-  youtubeEmbedUrl,
+  youtubeAppUrl,
   youtubeWatchUrl,
 } from "@/lib/youtube";
 
@@ -106,11 +106,15 @@ describe("url builders", () => {
     expect(youtubeWatchUrl("dQw4w9WgXcQ")).toBe("https://www.youtube.com/watch?v=dQw4w9WgXcQ");
   });
 
-  it("always embeds through youtube-nocookie, matching the CSP frame-src", () => {
-    const url = youtubeEmbedUrl("dQw4w9WgXcQ", { origin: "https://app.example", enableJsApi: true });
-    expect(url.startsWith("https://www.youtube-nocookie.com/embed/dQw4w9WgXcQ?")).toBe(true);
-    expect(url).toContain("enablejsapi=1");
-    expect(url).toContain("origin=https%3A%2F%2Fapp.example");
+  it("builds the mobile deep link the YouTube app registers", () => {
+    expect(youtubeAppUrl("dQw4w9WgXcQ")).toBe("vnd.youtube://dQw4w9WgXcQ");
+  });
+
+  it("exposes no embed builder, because nothing is embedded any more", async () => {
+    // The watch flow opens youtube.com; the CSP is frame-src 'none'. An embed
+    // helper coming back would be blocked at runtime, so its absence is asserted.
+    const youtube = await import("@/lib/youtube");
+    expect("youtubeEmbedUrl" in youtube).toBe(false);
   });
 });
 

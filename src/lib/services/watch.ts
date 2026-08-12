@@ -1,9 +1,24 @@
 /**
- * Watch-progress accounting — pure functions, no I/O, fully unit tested.
+ * Watch accounting — pure functions, no I/O, fully unit tested.
  *
- * The rule that matters: watched time is the measure of the UNION of timeline
- * segments the user actually played, not `currentTime`. Seeking to 90% and
- * stopping yields ~0 watched seconds, which is exactly the abuse this prevents.
+ * TWO GENERATIONS LIVE IN THIS FILE, deliberately:
+ *
+ *  1. The TIMER model, which the current watch flow uses. The video is opened on
+ *     YouTube itself, so there is no player to observe; the server stamps an
+ *     anchor when the video is opened and completion is decided by elapsed
+ *     server time alone (`isTimerSatisfied`, `remainingWatchSeconds`).
+ *
+ *  2. The SEGMENT model below (`mergeSegments`, `applyHeartbeat`,
+ *     `checkSequence`, `boundedElapsed`, `parseSegments`). It is no longer on
+ *     the request path — nothing calls it — but it is kept because
+ *     `WatchSession.segments` still holds rows written by it, and because it is
+ *     the accounting that any future in-page player would need. It is pure and
+ *     fully tested, so keeping it costs nothing at runtime.
+ *
+ * Honesty note: the timer model is weaker than segment tracking. It proves that
+ * time passed, not that a human watched. That trade was made deliberately when
+ * the flow moved out of an iframe; the anti-abuse layer compensates on the
+ * account/graph axis instead of the playback axis.
  */
 
 /** A half-open watched range in seconds: [from, to). */
@@ -190,6 +205,49 @@ export function applyHeartbeat(input: HeartbeatInput): HeartbeatOutcome {
     seeked: false,
     impossible: false,
   };
+}
+
+/* ------------------------------------------------------------------------- */
+/* Timer model — used by the current watch flow                               */
+/* ------------------------------------------------------------------------- */
+
+/**
+ * Whether enough server time has elapsed since the video was opened.
+ *
+ * `openedAt` is stamped by the server on the first open and never moved, so a
+ * page refresh, a second click, or a replayed request cannot restart, extend or
+ * multiply the timer. A session that was never opened is never satisfied, which
+ * is what stops a client from skipping straight to completion.
+ */
+export function isTimerSatisfied(openedAt: Date | null | undefined, requiredSec: number, now: Date = new Date()): boolean {
+  if (!openedAt) return false;
+  if (!Number.isFinite(requiredSec) || requiredSec <= 0) return false;
+  const elapsed = (now.getTime() - openedAt.getTime()) / 1000;
+  return elapsed + EPSILON >= requiredSec;
+}
+
+/** Whole seconds still to elapse before the requirement is met. */
+export function remainingWatchSeconds(
+  openedAt: Date | null | undefined,
+  requiredSec: number,
+  now: Date = new Date()
+): number {
+  const required = Number.isFinite(requiredSec) && requiredSec > 0 ? requiredSec : 0;
+  if (!openedAt) return required;
+  const elapsed = (now.getTime() - openedAt.getTime()) / 1000;
+  return Math.max(0, Math.ceil(required - elapsed));
+}
+
+/** Seconds credited so far, capped at the requirement. Never exceeds real time. */
+export function creditedWatchSeconds(
+  openedAt: Date | null | undefined,
+  requiredSec: number,
+  now: Date = new Date()
+): number {
+  const required = Number.isFinite(requiredSec) && requiredSec > 0 ? requiredSec : 0;
+  if (!openedAt) return 0;
+  const elapsed = Math.floor((now.getTime() - openedAt.getTime()) / 1000);
+  return Math.max(0, Math.min(required, elapsed));
 }
 
 export function requiredWatchSeconds(durationSec: number, requiredPercent: number): number {

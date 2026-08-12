@@ -30,7 +30,8 @@ export const RATE_LIMITS = {
   changePassword: { limit: 5, windowSeconds: 900 },
   emailVerification: { limit: 5, windowSeconds: 3600 },
   supportStart: { limit: 40, windowSeconds: 3600 },
-  supportHeartbeat: { limit: 600, windowSeconds: 3600 },
+  /** Timer polling: reads the clock, changes no counter. */
+  supportWatch: { limit: 600, windowSeconds: 3600 },
   supportComplete: { limit: 40, windowSeconds: 3600 },
   campaignWrite: { limit: 30, windowSeconds: 3600 },
   videoWrite: { limit: 30, windowSeconds: 3600 },

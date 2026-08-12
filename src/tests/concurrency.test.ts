@@ -1,9 +1,14 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { PrismaClient } from "@prisma/client";
-import { completeSupportSession, recordWatchHeartbeat, startSupportSession } from "@/lib/services/support";
+import {
+  completeSupportSession,
+  openWatchTarget,
+  startSupportSession,
+  watchTimerStatus,
+} from "@/lib/services/support";
 import { auditUserBalances } from "@/lib/services/ledger";
 import { hashPassword, referralCode } from "@/lib/security";
-import { SUPPORT_TRANSFER_CREDITS } from "@/lib/gamification";
+import { SUPPORT_TRANSFER_CREDITS, WATCH_RULES } from "@/lib/gamification";
 
 /**
  * Concurrency and integrity tests against a REAL Postgres database.
@@ -13,7 +18,8 @@ import { SUPPORT_TRANSFER_CREDITS } from "@/lib/gamification";
  *   - the reward budget can never be overspent,
  *   - the ledger and the cached balances agree after a burst,
  *   - a replayed completion pays once,
- *   - out-of-order and replayed heartbeats cannot corrupt watch accounting.
+ *   - the watch timer anchor is written once, so refreshes and repeated opens
+ *     cannot restart it, extend it, or credit time twice.
  *
  * They are skipped unless TEST_DATABASE_URL is set, so `npm test` stays fast and
  * hermetic; CI sets it against a disposable database. Skipping is explicit rather
@@ -38,20 +44,24 @@ const prisma = enabled ? new PrismaClient({ datasources: { db: { url: databaseUr
 const SUFFIX = `ct${Date.now().toString(36)}`;
 const CAPACITY = 5;
 const SUPPORTER_COUNT = 25;
+const VIDEO_ID = "dQw4w9WgXcQ";
+/** Ten minutes, so the 99% requirement is the specified 594 seconds. */
+const DURATION_SEC = 600;
+const REQUIRED_SEC = 594;
 
 type Seeded = {
   creatorId: string;
   campaignId: string;
   /**
-   * A second, separately funded campaign, used by the heartbeat test.
+   * A second, separately funded campaign, used by the watch-timer tests.
    *
    * The burst test deliberately drains `campaignId` to exactly zero remaining
    * budget — that is the invariant it proves. Starting another session on it
-   * therefore fails eligibility with CAMPAIGN_BUDGET_EXHAUSTED before a single
-   * heartbeat can be sent, which says nothing about heartbeat accounting. Watch
-   * state gets its own funded campaign so the two tests stay independent.
+   * therefore fails eligibility with CAMPAIGN_BUDGET_EXHAUSTED before the video
+   * can even be opened, which says nothing about the timer. The timer tests get
+   * their own funded campaign so the two stay independent.
    */
-  heartbeatCampaignId: string;
+  timerCampaignId: string;
   supporterIds: string[];
 };
 
@@ -72,10 +82,10 @@ async function seed(client: PrismaClient): Promise<Seeded> {
   const video = await client.video.create({
     data: {
       userId: creator.id,
-      youtubeVideoId: "dQw4w9WgXcQ",
-      youtubeUrl: "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+      youtubeVideoId: VIDEO_ID,
+      youtubeUrl: `https://www.youtube.com/watch?v=${VIDEO_ID}`,
       title: "Concurrency fixture",
-      durationSec: 60,
+      durationSec: DURATION_SEC,
       metadataSyncedAt: new Date(),
       status: "ACTIVE",
     },
@@ -89,7 +99,7 @@ async function seed(client: PrismaClient): Promise<Seeded> {
       startAt: new Date(Date.now() - 3600_000),
       endAt: new Date(Date.now() + 86_400_000),
       status: "ACTIVE",
-      requiredWatchPercent: 90,
+      requiredWatchPercent: WATCH_RULES.defaultRequiredPercent,
       rewardCredits: SUPPORT_TRANSFER_CREDITS,
       rewardXp: 25,
       // Budget sized to exactly CAPACITY transfers: the atomic conditional update
@@ -100,21 +110,22 @@ async function seed(client: PrismaClient): Promise<Seeded> {
     },
   });
 
-  const heartbeatCampaign = await client.campaign.create({
+  const timerCampaign = await client.campaign.create({
     data: {
       creatorId: creator.id,
       videoId: video.id,
-      title: "Concurrency campaign heartbeat",
+      title: "Concurrency campaign timer",
       startAt: new Date(Date.now() - 3600_000),
       endAt: new Date(Date.now() + 86_400_000),
       status: "ACTIVE",
-      requiredWatchPercent: 90,
+      requiredWatchPercent: WATCH_RULES.defaultRequiredPercent,
       rewardCredits: SUPPORT_TRANSFER_CREDITS,
       rewardXp: 25,
-      // Funded for a single transfer: enough to start one session, which is all
-      // the heartbeat test needs.
-      budgetCredits: SUPPORT_TRANSFER_CREDITS,
-      maxTotalSupports: 1,
+      // Funded for several transfers: the timer tests start more than one session
+      // on this campaign, and an exhausted budget would fail them at eligibility
+      // for a reason that has nothing to do with the timer.
+      budgetCredits: SUPPORT_TRANSFER_CREDITS * 4,
+      maxTotalSupports: 4,
       tasks: { create: [{ type: "WATCH_VIDEO", required: true, sortOrder: 0 }] },
     },
   });
@@ -139,34 +150,34 @@ async function seed(client: PrismaClient): Promise<Seeded> {
   return {
     creatorId: creator.id,
     campaignId: campaign.id,
-    heartbeatCampaignId: heartbeatCampaign.id,
+    timerCampaignId: timerCampaign.id,
     supporterIds,
   };
 }
 
-/** Marks the watch task satisfied without pretending the user watched anything. */
+/**
+ * Marks the watch task satisfied without pretending the user watched anything.
+ *
+ * The anchor is backdated past the requirement, which is exactly what completion
+ * re-checks. Faking `accumulatedSec` alone would no longer work — settlement
+ * recomputes from `openedAt` — and that is the point of the test below.
+ */
 async function satisfyWatch(client: PrismaClient, sessionId: string) {
   const session = await client.supportSession.findUniqueOrThrow({
     where: { id: sessionId },
     include: { watchSession: true },
   });
-  const duration = session.watchSession?.durationSec ?? 60;
+  const required = session.watchSession?.requiredSec ?? 60;
   await client.watchSession.update({
     where: { sessionId },
     data: {
-      accumulatedSec: duration,
-      segments: [[0, duration]],
-      heartbeats: 6,
-      lastPosition: duration,
-      lastSequence: 6,
-      // Backdate the start so both the elapsed-time check and the real-time floor
-      // (minimumElapsedSeconds) see a plausible watch.
-      startedAt: new Date(Date.now() - 600_000),
+      openedAt: new Date(Date.now() - (required + 60) * 1000),
+      accumulatedSec: required,
     },
   });
   await client.supportSession.update({
     where: { id: sessionId },
-    data: { state: "WATCH_THRESHOLD_REACHED", startedAt: new Date(Date.now() - 600_000) },
+    data: { state: "WATCH_THRESHOLD_REACHED", startedAt: new Date(Date.now() - (required + 60) * 1000) },
   });
   await client.supportTask.updateMany({
     where: { sessionId, type: "WATCH_VIDEO" },
@@ -297,80 +308,158 @@ describe.skipIf(!enabled)("support completion under concurrency", () => {
   );
 
   it(
-    "refuses replayed and out-of-order heartbeats without corrupting watch state",
+    "writes the watch anchor once, so refreshes and repeated opens cannot restart or extend the timer",
     async () => {
       const client = prisma!;
+      const supporterId = fixture.supporterIds[SUPPORTER_COUNT - 1];
 
-      // A fresh supporter and a fresh session, so this test does not depend on
-      // whatever the concurrency burst left behind.
       const started = await startSupportSession({
-        supporterId: fixture.supporterIds[SUPPORTER_COUNT - 1],
-        campaignId: fixture.heartbeatCampaignId,
+        supporterId,
+        campaignId: fixture.timerCampaignId,
         ipHash: null,
         userAgentHash: null,
       });
       const sessionId = started.session.id;
-      const supporterId = fixture.supporterIds[SUPPORTER_COUNT - 1];
 
-      // Two legitimate beats, spaced by real time.
+      // requiredSec is derived server-side from the video duration, not sent by
+      // anyone: 600s at 99% is 594s.
+      // 600s at 99% → 594s, computed server-side from YouTube's duration.
+      expect(started.requiredWatchSeconds).toBe(REQUIRED_SEC);
+      expect(started.openedAt).toBeNull();
+      expect(started.remainingSeconds).toBe(REQUIRED_SEC);
+
+      // Not opened yet → asking for status is refused, and the task cannot pass.
+      await expect(watchTimerStatus({ sessionId, supporterId })).rejects.toThrow();
+
+      const first = await openWatchTarget({ sessionId, supporterId });
+      expect(first.satisfied).toBe(false);
+      expect(first.requiredSec).toBe(REQUIRED_SEC);
+      expect(first.watchUrl).toBe(`https://www.youtube.com/watch?v=${VIDEO_ID}`);
+
+      const anchor = (await client.watchSession.findUniqueOrThrow({ where: { sessionId } })).openedAt;
+      expect(anchor).not.toBeNull();
+
+      // THE INVARIANT: opening again — a refresh, a double click, a replayed
+      // request — must reuse the same anchor. If it moved, a supporter could keep
+      // the timer at "just started" forever, or restart it to avoid ever finishing;
+      // if it stacked, two timers would run for one session.
+      const second = await openWatchTarget({ sessionId, supporterId });
+      const third = await openWatchTarget({ sessionId, supporterId });
+      const stillAnchor = (await client.watchSession.findUniqueOrThrow({ where: { sessionId } })).openedAt;
+      expect(stillAnchor!.getTime()).toBe(anchor!.getTime());
+      expect(second.openedAt.getTime()).toBe(anchor!.getTime());
+      expect(third.openedAt.getTime()).toBe(anchor!.getTime());
+
+      // Concurrent opens race on the same conditional UPDATE; all must agree.
+      const raced = await Promise.all(
+        Array.from({ length: 5 }, () => openWatchTarget({ sessionId, supporterId }))
+      );
+      for (const result of raced) {
+        expect(result.openedAt.getTime()).toBe(anchor!.getTime());
+      }
+
+      // Polling status repeatedly must not accumulate anything: the credited value
+      // is recomputed from the anchor, never incremented.
+      const a = await watchTimerStatus({ sessionId, supporterId });
+      const b = await watchTimerStatus({ sessionId, supporterId });
+      const c = await watchTimerStatus({ sessionId, supporterId });
+      expect(a.satisfied).toBe(false);
+      expect(c.elapsedSec).toBeLessThan(10);
+      expect(b.remainingSec).toBeGreaterThan(REQUIRED_SEC - 20);
+      const watchRow = await client.watchSession.findUniqueOrThrow({ where: { sessionId } });
+      expect(watchRow.accumulatedSec).toBe(0);
+
+      // Completing before the time has elapsed must be refused even though the
+      // client has "asked" many times.
+      await expect(completeSupportSession({ sessionId, supporterId })).rejects.toThrow();
+
+      // Backdate the anchor past the requirement: the same reads now satisfy it.
+      await client.watchSession.update({
+        where: { sessionId },
+        data: { openedAt: new Date(Date.now() - (REQUIRED_SEC + 60) * 1000) },
+      });
+      const done = await watchTimerStatus({ sessionId, supporterId });
+      expect(done.satisfied).toBe(true);
+      expect(done.remainingSec).toBe(0);
+      expect(done.elapsedSec).toBe(REQUIRED_SEC);
+
+      const satisfiedRow = await client.watchSession.findUniqueOrThrow({ where: { sessionId } });
+      // Never more than the requirement, so the column cannot be inflated by polling.
+      expect(satisfiedRow.accumulatedSec).toBe(REQUIRED_SEC);
+      const completedAt = satisfiedRow.completedAt;
+      expect(completedAt).not.toBeNull();
+
+      // A second status read must not move completedAt: the first crossing stands.
+      await watchTimerStatus({ sessionId, supporterId });
+      const again = await client.watchSession.findUniqueOrThrow({ where: { sessionId } });
+      expect(again.completedAt!.getTime()).toBe(completedAt!.getTime());
+      expect(again.accumulatedSec).toBe(REQUIRED_SEC);
+
+      const task = await client.supportTask.findFirstOrThrow({
+        where: { sessionId, type: "WATCH_VIDEO" },
+      });
+      expect(task.state).toBe("SATISFIED");
+      expect(task.method).toBe("PLATFORM_OBSERVED");
+    },
+    60_000
+  );
+
+  it(
+    "refuses to settle a session whose anchor does not cover the requirement, even if the task row says satisfied",
+    async () => {
+      const client = prisma!;
+      const supporterId = fixture.supporterIds[SUPPORTER_COUNT - 2];
+
+      const started = await startSupportSession({
+        supporterId,
+        campaignId: fixture.timerCampaignId,
+        ipHash: null,
+        userAgentHash: null,
+      });
+      const sessionId = started.session.id;
+      await openWatchTarget({ sessionId, supporterId });
+
+      // Forge the state a compromised client would try to reach: the task marked
+      // satisfied and the accounting column filled in, with no time actually spent.
+      await client.supportTask.updateMany({
+        where: { sessionId, type: "WATCH_VIDEO" },
+        data: { state: "SATISFIED", method: "PLATFORM_OBSERVED", satisfiedAt: new Date() },
+      });
+      await client.watchSession.update({
+        where: { sessionId },
+        data: { accumulatedSec: REQUIRED_SEC },
+      });
+      await client.supportSession.update({
+        where: { id: sessionId },
+        data: { state: "WATCH_THRESHOLD_REACHED" },
+      });
+
+      // Settlement recomputes from the anchor, so the forgery does not pay.
+      await expect(completeSupportSession({ sessionId, supporterId })).rejects.toThrow();
+
+      // What matters, and what is actually guaranteed: nothing was paid and no
+      // Support row exists.
       //
-      // startSupportSession() stamps lastHeartbeatAt with "now", and the cadence
-      // gate rejects anything arriving faster than a quarter of the expected
-      // interval. Both beats are therefore backdated: without this the very first
-      // beat is rejected as TOO_FREQUENT, and the rejectedBeats assertion below
-      // would be counting that instead of the replay and the stale beat it is
-      // meant to be about.
-      await client.watchSession.update({
-        where: { sessionId },
-        data: { lastHeartbeatAt: new Date(Date.now() - 10_000) },
-      });
-      const first = await recordWatchHeartbeat({
-        sessionId,
-        supporterId,
-        position: 5,
-        playerState: "PLAYING",
-        sequence: 1,
-      });
-      expect(first.rejected).toBe(false);
-      await client.watchSession.update({
-        where: { sessionId },
-        data: { lastHeartbeatAt: new Date(Date.now() - 10_000) },
-      });
-      const second = await recordWatchHeartbeat({
-        sessionId,
-        supporterId,
-        position: 15,
-        playerState: "PLAYING",
-        sequence: 2,
-      });
-      expect(second.rejected).toBe(false);
-      const credited = second.accumulatedSec;
+      // NOT asserted: state === "FAILED". runCompletion writes the FAILED/DENIED
+      // marking and then throws, and both happen inside the same
+      // prisma.$transaction — so the marking rolls back with the throw and the
+      // session stays where it was. That is pre-existing behaviour on every
+      // failure path in this function (REQUIRED_TASK_INCOMPLETE and RISK_DENIED
+      // included), verified against the untouched REQUIRED_TASK_INCOMPLETE path,
+      // not something the watch timer introduced. Asserting FAILED here would
+      // encode a guarantee the code does not currently provide.
+      const session = await client.supportSession.findUniqueOrThrow({ where: { id: sessionId } });
+      expect(session.supportId).toBeNull();
+      expect(session.rewardState).not.toBe("CONFIRMED");
 
-      // Replay of sequence 2, and a late sequence 1: neither may change anything.
-      const replay = await recordWatchHeartbeat({
-        sessionId,
-        supporterId,
-        position: 400,
-        playerState: "PLAYING",
-        sequence: 2,
-      });
-      const stale = await recordWatchHeartbeat({
-        sessionId,
-        supporterId,
-        position: 500,
-        playerState: "PLAYING",
-        sequence: 1,
-      });
+      const paid = await client.creditLedger.count({ where: { sessionId } });
+      expect(paid).toBe(0);
+      const support = await client.support.count({ where: { supporterId, campaignId: fixture.timerCampaignId } });
+      expect(support).toBe(0);
 
-      expect(replay.rejected).toBe(true);
-      expect(stale.rejected).toBe(true);
-      expect(replay.accumulatedSec).toBe(credited);
-      expect(stale.accumulatedSec).toBe(credited);
-
-      const watch = await client.watchSession.findUniqueOrThrow({ where: { sessionId } });
-      expect(watch.accumulatedSec).toBe(credited);
-      expect(watch.lastSequence).toBe(2);
-      expect(watch.rejectedBeats).toBe(2);
+      // The reward is still unreachable on a retry: the anchor has not moved.
+      await expect(completeSupportSession({ sessionId, supporterId })).rejects.toThrow();
+      expect(await client.creditLedger.count({ where: { sessionId } })).toBe(0);
     },
     60_000
   );

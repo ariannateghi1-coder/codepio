@@ -22,9 +22,14 @@ import type { SupportSessionState, RewardState } from "@prisma/client";
 /** Progress transitions. Empty array = terminal. */
 const STATE_TRANSITIONS: Record<SupportSessionState, readonly SupportSessionState[]> = {
   STARTED: ["VIDEO_OPENED", "WATCHING", "FAILED", "EXPIRED", "ABANDONED"],
-  VIDEO_OPENED: ["WATCHING", "FAILED", "EXPIRED", "ABANDONED"],
-  // Watching can regress to VIDEO_OPENED only in the sense of staying put; the
-  // threshold is the one forward gate.
+  // VIDEO_OPENED goes straight to the threshold in the current flow: the video is
+  // watched on YouTube, so no heartbeat ever moves the session to WATCHING and
+  // the timer crossing is the next real event. Without this edge the session
+  // stayed VIDEO_OPENED forever — the reward still worked (settlement re-checks
+  // the anchor, not the state), but the state stopped describing reality and
+  // admin/history views showed an opened session as never having progressed.
+  VIDEO_OPENED: ["WATCHING", "WATCH_THRESHOLD_REACHED", "VERIFYING", "FAILED", "EXPIRED", "ABANDONED"],
+  // WATCHING is retained for sessions created under the old heartbeat flow.
   WATCHING: ["WATCHING", "WATCH_THRESHOLD_REACHED", "FAILED", "EXPIRED", "ABANDONED"],
   // The threshold is sticky: additional heartbeats must not drop it back to
   // WATCHING, which would let a user lose credited progress by pausing.

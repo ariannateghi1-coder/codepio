@@ -2,23 +2,27 @@ import { parseBody } from "@/lib/api";
 import { active } from "@/lib/handler";
 import { supportStartSchema } from "@/lib/validators";
 import { startSupportSession } from "@/lib/services/support";
-import { youtubeEmbedUrl } from "@/lib/youtube";
-import { env } from "@/lib/env";
+import { youtubeWatchUrl } from "@/lib/youtube";
 import { youtubeConnectionState } from "@/lib/services/youtube-api";
-import { WATCH_RULES } from "@/lib/gamification";
 
 /**
  * Starts a support session.
  *
- * Requires an ACTIVE account, CSRF, and passes the rate-limit
- * policy. Eligibility, duplicate detection and the "one open session" rule live
- * in the service so they hold no matter which caller invokes them.
+ * Requires an ACTIVE account, CSRF, and passes the rate-limit policy.
+ * Eligibility, duplicate detection and the "one open session" rule live in the
+ * service so they hold no matter which caller invokes them.
  *
- * The response tells the client exactly what will be verified and how, including
- * whether YouTube-side checks are possible for this user right now — so the UI
- * never promises verification it can't perform. The connection STATE is returned
- * rather than a boolean, because "never connected" and "connection expired, please
- * reconnect" need different copy.
+ * WATCH TARGET: a canonical youtube.com watch URL, NOT an embed. The supporter
+ * watches on YouTube (the app in the app, the site on desktop), which is why
+ * there is no embedUrl and no heartbeat cadence here any more. `requiredWatchSeconds`
+ * is computed server-side from the duration YouTube reported; the client is told
+ * the number so it can show progress, but it has no way to change it.
+ *
+ * The response also states what will be verified and how, including whether
+ * YouTube-side checks are possible for this user right now, so the UI never
+ * promises verification it cannot perform. The connection STATE is returned
+ * rather than a boolean, because "never connected" and "connection expired,
+ * please reconnect" need different copy.
  */
 export const POST = active(
   "support.start",
@@ -43,15 +47,14 @@ export const POST = active(
         id: result.video.id,
         youtubeVideoId: result.video.youtubeVideoId,
         durationSec: result.video.durationSec,
-        embedUrl: youtubeEmbedUrl(result.video.youtubeVideoId, {
-          origin: env.NEXT_PUBLIC_APP_URL,
-          enableJsApi: true,
-        }),
+        /** Opened in a new tab / the YouTube app. Never embedded. */
+        watchUrl: youtubeWatchUrl(result.video.youtubeVideoId),
       },
       requiredWatchSeconds: result.requiredWatchSeconds,
+      /** Null until the video is opened; the timer starts on the server then. */
+      openedAt: result.openedAt,
+      remainingSeconds: result.remainingSeconds,
       estimatedSeconds: result.estimatedSeconds,
-      /** Cadence the client should use; the server validates what it observes. */
-      heartbeatSeconds: WATCH_RULES.heartbeatSeconds,
       tasks: result.tasks.map((task) => ({
         ...task,
         /** Honest verification capability, per task, for this user. */

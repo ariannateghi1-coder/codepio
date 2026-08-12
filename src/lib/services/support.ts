@@ -15,12 +15,9 @@ import {
 import { REPUTATION } from "../gamification";
 import { assessSessionEvidence, assessSupportRisk, persistAbuseSignals, scoreFromReasons, type RiskReason } from "./anti-abuse";
 import {
-  applyHeartbeat,
-  boundedElapsed,
-  checkSequence,
-  isWatchSatisfied,
-  minimumElapsedSeconds,
-  parseSegments,
+  creditedWatchSeconds,
+  isTimerSatisfied,
+  remainingWatchSeconds,
   requiredWatchSeconds,
   watchPercent,
 } from "./watch";
@@ -32,13 +29,23 @@ import { campaignAvailabilityFailure } from "./campaign-eligibility";
 import { evaluateBadges } from "./badges";
 import { registerStreakDay } from "./streak";
 import { writeAuditTx } from "../audit";
+import { youtubeWatchUrl } from "../youtube";
 
 /**
  * Support Exchange core service.
  *
  * The product loop, enforced end-to-end:
- *   start → watch (server-verified segments) → subscribe/like (YouTube API) →
+ *   start → open on YouTube (server-timed) → subscribe/like (YouTube API) →
  *   optional comment → risk assessment → reward (instant / pending / denied)
+ *
+ * WATCH MODEL — stated plainly because it is weaker than it looks:
+ *   The video is opened on youtube.com, not embedded, so there is no player to
+ *   observe. Completion is decided by elapsed SERVER time since the first open:
+ *   `WatchSession.openedAt` is stamped once and never moved, and the requirement
+ *   is ceil(durationSec * WATCH_RULES.defaultRequiredPercent / 100). We do not
+ *   claim YouTube reported the watch. The client supplies no time, no position
+ *   and no completion flag, so there is nothing in the request to forge; what it
+ *   cannot prove is that a human was watching during those seconds.
  *
  * Design decisions worth stating:
  *
@@ -80,6 +87,8 @@ const RULE_MESSAGES: Record<string, string> = {
   CREATOR_UNAVAILABLE: "حساب سازنده این کمپین در دسترس نیست.",
   VIDEO_UNAVAILABLE: "ویدیوی این کمپین در دسترس نیست.",
   SESSION_NOT_FOUND: "این نشست حمایت پیدا نشد.",
+  VIDEO_NOT_OPENED: "ابتدا ویدیو را در یوتیوب باز کنید تا زمان تماشا شروع شود.",
+  VIDEO_DURATION_UNKNOWN: "مدت‌زمان این ویدیو از یوتیوب دریافت نشده است؛ تا همگام‌سازی، تماشا قابل ثبت نیست.",
   SESSION_CLOSED: "این نشست حمایت بسته شده است.",
   SESSION_EXPIRED: "زمان این نشست حمایت به پایان رسیده است.",
   WATCH_INCOMPLETE: "تماشای ویدیو کامل نشده است.",
@@ -88,6 +97,19 @@ const RULE_MESSAGES: Record<string, string> = {
   RISK_DENIED: "این حمایت به دلیل رفتار مشکوک تأیید نشد.",
   ALREADY_SUPPORTED_PAIR: "در بازه خنک‌سازی این سازنده هستید.",
 };
+
+/**
+ * Human remaining time, e.g. «۳ دقیقه و ۲۰ ثانیه». Persian digits come from the
+ * client formatter; this builds the structure only.
+ */
+function formatRemaining(totalSeconds: number): string {
+  const s = Math.max(0, Math.round(totalSeconds));
+  const minutes = Math.floor(s / 60);
+  const seconds = s % 60;
+  if (minutes > 0 && seconds > 0) return `حدود ${minutes} دقیقه و ${seconds} ثانیه`;
+  if (minutes > 0) return `حدود ${minutes} دقیقه`;
+  return `${seconds} ثانیه`;
+}
 
 function ruleError(rule: keyof typeof RULE_MESSAGES | string): SupportServiceError {
   return new SupportServiceError(rule, RULE_MESSAGES[rule] ?? "امکان انجام این عملیات وجود ندارد.");
@@ -197,6 +219,10 @@ export type StartSupportResult = {
   session: SupportSession;
   video: { id: string; youtubeVideoId: string; durationSec: number | null };
   requiredWatchSeconds: number;
+  /** Null until the supporter opens the video; the timer runs from this instant. */
+  openedAt: Date | null;
+  /** Seconds still to elapse. Equals requiredWatchSeconds before the first open. */
+  remainingSeconds: number;
   tasks: { type: string; required: boolean; rewardXp: number }[];
   estimatedSeconds: number;
 };
@@ -219,7 +245,9 @@ export async function startSupportSession(input: StartSupportInput): Promise<Sta
 
     const video = campaign.video!;
     const durationSec = video.durationSec ?? 0;
-    const requiredSec = durationSec > 0 ? requiredWatchSeconds(durationSec, campaign.requiredWatchPercent) : 0;
+    // Derived server-side from the duration YouTube reported, using the platform
+    // constant. The campaign cannot lower it and the client cannot send it.
+    const requiredSec = durationSec > 0 ? requiredWatchSeconds(durationSec, WATCH_RULES.defaultRequiredPercent) : 0;
 
     const tasks = campaign.tasks.length
       ? campaign.tasks
@@ -274,10 +302,19 @@ export async function startSupportSession(input: StartSupportInput): Promise<Sta
       });
     }
 
+    // Reusing an open session must also reuse its anchor, so re-entering the flow
+    // shows the time already served instead of silently restarting the timer.
+    const existingWatch = open
+      ? await tx.watchSession.findUnique({ where: { sessionId: session.id }, select: { openedAt: true } })
+      : null;
+    const openedAt = existingWatch?.openedAt ?? null;
+
     return {
       session,
       video: { id: video.id, youtubeVideoId: video.youtubeVideoId, durationSec: video.durationSec },
       requiredWatchSeconds: requiredSec,
+      openedAt,
+      remainingSeconds: remainingWatchSeconds(openedAt, requiredSec),
       // Credits are not per-task: the support pays one fixed transfer, so the
       // client is told the XP bonus per task and the transfer separately.
       tasks: tasks.map((task) => ({
@@ -291,171 +328,154 @@ export async function startSupportSession(input: StartSupportInput): Promise<Sta
 }
 
 /* ------------------------------------------------------------------------- */
-/* Watch heartbeat                                                            */
+/* Watch timer                                                                */
 /* ------------------------------------------------------------------------- */
 
-export type HeartbeatResult = {
-  accumulatedSec: number;
+export type WatchTimerResult = {
+  /** Canonical youtube.com watch URL. The client opens this, we do not embed it. */
+  watchUrl: string;
   requiredSec: number;
+  /** Whole seconds still to elapse. 0 once the requirement is met. */
+  remainingSec: number;
+  /** Seconds credited so far, capped at requiredSec. */
+  elapsedSec: number;
   percent: number;
   satisfied: boolean;
+  openedAt: Date;
   state: SupportSession["state"];
-  flagged: boolean;
-  /** True when this beat was refused (replay / out-of-order / too frequent). */
-  rejected: boolean;
-  /** Sequence the server has accepted, so the client can resynchronise. */
-  acceptedSequence: number;
 };
 
 /**
- * Applies one client heartbeat. The client reports its player position; the
- * server decides what that is worth by comparing it against the wall-clock time
- * it actually measured since the previous heartbeat. This is what makes
- * `seek(540)` worthless.
+ * Loads a session for the watch timer, enforcing ownership and liveness.
  *
- * Ordering is explicit rather than inferred: `lastSequence` rejects replays and
- * out-of-order delivery, and `lastPosition` is the credit cursor. Deriving the
- * cursor from the segment list (the previous approach) lost information after a
- * rewind, because two different playback positions can map to the same segment.
- *
- * A refused beat is not an error the user sees — the session simply does not
- * advance, and repeated refusals become an abuse signal.
+ * Ownership is checked here rather than in the route: a session id is not a
+ * capability, so another user holding the id gets SESSION_NOT_FOUND.
  */
-export async function recordWatchHeartbeat(input: {
-  sessionId: string;
-  supporterId: string;
-  position: number;
-  playerState: string;
-  sequence: number;
-  hiddenSec?: number;
-}): Promise<HeartbeatResult> {
+async function loadLiveSession(tx: Tx, sessionId: string, supporterId: string) {
+  const session = await tx.supportSession.findUnique({
+    where: { id: sessionId },
+    include: { watchSession: true, video: { select: { youtubeVideoId: true } } },
+  });
+
+  if (!session || session.supporterId !== supporterId) throw ruleError("SESSION_NOT_FOUND");
+  if (!session.watchSession) throw ruleError("SESSION_NOT_FOUND");
+  if (session.expiresAt < new Date()) {
+    await tx.supportSession.update({ where: { id: session.id }, data: { state: "EXPIRED" } });
+    throw ruleError("SESSION_EXPIRED");
+  }
+  if (isTerminal(session.state)) throw ruleError("SESSION_CLOSED");
+  return session;
+}
+
+/**
+ * Marks the video as opened and starts the timer.
+ *
+ * IDEMPOTENT BY CONSTRUCTION. `openedAt` is written with a conditional UPDATE
+ * (`WHERE "openedAt" IS NULL`) inside a row lock, so refreshing the page,
+ * double-clicking, or replaying this request cannot restart the clock, extend it,
+ * or run two timers for one session. Every later call returns the SAME anchor and
+ * therefore the same remaining time.
+ *
+ * Progress is not credited here — the timer is read, never accumulated, so there
+ * is no counter to inflate by calling this repeatedly.
+ */
+export async function openWatchTarget(input: { sessionId: string; supporterId: string }): Promise<WatchTimerResult> {
   return prisma.$transaction(async (tx) => {
-    await tx.$queryRaw<Array<{ id: string }>>`
+    await tx.$queryRaw`
       SELECT "id" FROM "WatchSession" WHERE "sessionId" = ${input.sessionId} FOR UPDATE
     `;
-    const session = await tx.supportSession.findUnique({
-      where: { id: input.sessionId },
-      include: { watchSession: true, campaign: { select: { requiredWatchPercent: true } } },
-    });
+    const session = await loadLiveSession(tx, input.sessionId, input.supporterId);
+    const watch = session.watchSession!;
 
-    // Ownership is checked server-side; a session id is not a capability.
-    if (!session || session.supporterId !== input.supporterId) throw ruleError("SESSION_NOT_FOUND");
-    if (!session.watchSession) throw ruleError("SESSION_NOT_FOUND");
-    if (session.expiresAt < new Date()) {
-      await tx.supportSession.update({ where: { id: session.id }, data: { state: "EXPIRED" } });
-      throw ruleError("SESSION_EXPIRED");
-    }
-    if (isTerminal(session.state)) throw ruleError("SESSION_CLOSED");
+    if (!session.video?.youtubeVideoId) throw ruleError("VIDEO_UNAVAILABLE");
+    if (watch.requiredSec <= 0) throw ruleError("VIDEO_DURATION_UNKNOWN");
 
-    const watch = session.watchSession;
-    const now = new Date();
-    const rawElapsed = (now.getTime() - watch.lastHeartbeatAt.getTime()) / 1000;
-
-    // ---- Sequence / cadence gate ----------------------------------------
-    const gate = checkSequence({
-      sequence: input.sequence,
-      lastSequence: watch.lastSequence,
-      elapsedWallSeconds: rawElapsed,
-      expectedIntervalSeconds: WATCH_RULES.heartbeatSeconds,
-    });
-
-    if (!gate.accepted) {
-      await tx.watchSession.update({
-        where: { sessionId: session.id },
-        data: { rejectedBeats: { increment: 1 } },
-      });
-      if (gate.reason !== "TOO_FREQUENT") {
-        // A replay attempt is worth recording; mere jitter is not.
-        await persistAbuseSignals(tx, {
-          userId: input.supporterId,
-          sessionId: session.id,
-          reasons: [{ type: "HEARTBEAT_REPLAY", severity: 3, note: gate.note }],
-        });
-      }
-      return {
-        accumulatedSec: watch.accumulatedSec,
-        requiredSec: watch.requiredSec,
-        percent: watchPercent(watch.accumulatedSec, watch.durationSec),
-        satisfied: Boolean(watch.completedAt),
-        state: session.state,
-        flagged: false,
-        rejected: true,
-        acceptedSequence: watch.lastSequence,
-      };
-    }
-
-    // Cap the allowance so a long silence cannot bank credit for a later jump.
-    const elapsedWallSeconds = boundedElapsed(rawElapsed, WATCH_RULES.heartbeatSeconds);
-
-    const outcome = applyHeartbeat({
-      segments: parseSegments(watch.segments),
-      previousPosition: watch.lastPosition,
-      position: input.position,
-      elapsedWallSeconds,
-      durationSec: watch.durationSec,
-      maxRate: WATCH_RULES.maxPlaybackRate,
-    });
-
-    const satisfied =
-      watch.durationSec > 0 &&
-      isWatchSatisfied(outcome.accumulatedSec, watch.durationSec, session.campaign.requiredWatchPercent);
-
-    const acceptedSequence = input.sequence;
-
-    await tx.watchSession.update({
-      where: { sessionId: session.id },
-      data: {
-        segments: outcome.segments as unknown as Prisma.InputJsonValue,
-        accumulatedSec: Math.floor(outcome.accumulatedSec),
-        // The cursor advances even on a rejected-as-seek jump: the user really is
-        // at the new position, they simply earned nothing for getting there.
-        lastPosition: Math.floor(Math.min(Math.max(0, input.position), watch.durationSec || input.position)),
-        lastSequence: acceptedSequence,
-        playerState: input.playerState.slice(0, 20),
-        heartbeats: { increment: 1 },
-        seekCount: outcome.seeked ? { increment: 1 } : undefined,
-        hiddenSec: input.hiddenSec ? { increment: Math.floor(input.hiddenSec) } : undefined,
-        lastHeartbeatAt: now,
-        completedAt: satisfied ? (watch.completedAt ?? now) : watch.completedAt,
-      },
-    });
-
-    if (outcome.impossible) {
-      // Recorded now, weighed later at completion — a single anomaly is a signal,
-      // not a verdict.
-      await persistAbuseSignals(tx, {
-        userId: input.supporterId,
-        sessionId: session.id,
-        reasons: [{ type: "CLIENT_TAMPERING", severity: 6, note: "heartbeat reported non-physical progress" }],
+    // First open wins. A concurrent duplicate updates 0 rows and reuses the anchor.
+    if (!watch.openedAt) {
+      await tx.watchSession.updateMany({
+        where: { sessionId: session.id, openedAt: null },
+        data: { openedAt: new Date() },
       });
     }
 
-    // The state machine decides whether the desired transition is legal, so a
-    // late beat can never drag a VERIFYING session back to WATCHING.
-    const desired = satisfied ? "WATCH_THRESHOLD_REACHED" : "WATCHING";
-    const resolved = nextState(session.state, desired);
+    const fresh = await tx.watchSession.findUniqueOrThrow({ where: { sessionId: session.id } });
+    const openedAt = fresh.openedAt!;
+
+    const resolved = nextState(session.state, "VIDEO_OPENED");
     if (resolved !== session.state) {
       await tx.supportSession.update({ where: { id: session.id }, data: { state: resolved } });
     }
 
+    return buildTimerResult(session.video.youtubeVideoId, fresh.requiredSec, fresh.durationSec, openedAt, resolved);
+  });
+}
+
+/**
+ * Reports timer state and, once the requirement is met, satisfies the watch task.
+ *
+ * Read-then-advance rather than accumulate: the elapsed value is recomputed from
+ * the anchor on every call, so the result depends only on server time. Calling
+ * this early, often, or never changes nothing except what the user is shown.
+ */
+export async function watchTimerStatus(input: { sessionId: string; supporterId: string }): Promise<WatchTimerResult> {
+  return prisma.$transaction(async (tx) => {
+    const session = await loadLiveSession(tx, input.sessionId, input.supporterId);
+    const watch = session.watchSession!;
+    if (!watch.openedAt) throw ruleError("VIDEO_NOT_OPENED");
+
+    const satisfied = isTimerSatisfied(watch.openedAt, watch.requiredSec);
+    let resolved = session.state;
+
     if (satisfied) {
+      const now = new Date();
+      // The accounting columns are written only at the moment the requirement is
+      // met, and only up to requiredSec, so they can never exceed elapsed real
+      // time. completedAt is set once (?? guard) to keep the first crossing.
+      await tx.watchSession.update({
+        where: { sessionId: session.id },
+        data: {
+          accumulatedSec: watch.requiredSec,
+          completedAt: watch.completedAt ?? now,
+        },
+      });
+      resolved = nextState(session.state, "WATCH_THRESHOLD_REACHED");
+      if (resolved !== session.state) {
+        await tx.supportSession.update({ where: { id: session.id }, data: { state: resolved } });
+      }
       await tx.supportTask.updateMany({
         where: { sessionId: session.id, type: "WATCH_VIDEO", state: { not: "SATISFIED" } },
         data: { state: "SATISFIED", method: "PLATFORM_OBSERVED", satisfiedAt: now },
       });
     }
 
-    return {
-      accumulatedSec: Math.floor(outcome.accumulatedSec),
-      requiredSec: watch.requiredSec,
-      percent: watchPercent(outcome.accumulatedSec, watch.durationSec),
-      satisfied,
-      state: resolved,
-      flagged: outcome.impossible,
-      rejected: false,
-      acceptedSequence,
-    };
+    return buildTimerResult(
+      session.video?.youtubeVideoId ?? "",
+      watch.requiredSec,
+      watch.durationSec,
+      watch.openedAt,
+      resolved
+    );
   });
+}
+
+function buildTimerResult(
+  youtubeVideoId: string,
+  requiredSec: number,
+  durationSec: number,
+  openedAt: Date,
+  state: SupportSession["state"]
+): WatchTimerResult {
+  const elapsedSec = creditedWatchSeconds(openedAt, requiredSec);
+  return {
+    watchUrl: youtubeWatchUrl(youtubeVideoId),
+    requiredSec,
+    remainingSec: remainingWatchSeconds(openedAt, requiredSec),
+    elapsedSec,
+    percent: watchPercent(elapsedSec, requiredSec),
+    satisfied: isTimerSatisfied(openedAt, requiredSec),
+    openedAt,
+    state,
+  };
 }
 
 /* ------------------------------------------------------------------------- */
@@ -492,7 +512,6 @@ export async function verifySessionTasks(sessionId: string, supporterId: string)
     include: {
       tasks: true,
       watchSession: true,
-      campaign: { select: { requiredWatchPercent: true } },
       video: { select: { youtubeVideoId: true } },
       creator: { select: { youtubeConnection: { select: { channelId: true } } } },
     },
@@ -525,19 +544,26 @@ export async function verifySessionTasks(sessionId: string, supporterId: string)
 
     if (task.type === "WATCH_VIDEO") {
       const watch = session.watchSession;
-      satisfied = Boolean(
-        watch &&
-          watch.durationSec > 0 &&
-          isWatchSatisfied(watch.accumulatedSec, watch.durationSec, session.campaign.requiredWatchPercent)
-      );
+      // Recomputed from the server anchor, not read from a stored flag: the task
+      // cannot be satisfied by any request, only by time having passed.
+      satisfied = Boolean(watch && isTimerSatisfied(watch.openedAt, watch.requiredSec));
       // Deliberately PLATFORM_OBSERVED, never YOUTUBE_API: no YouTube endpoint
-      // reports how much of a video a specific user watched.
+      // reports how much of a video a specific user watched. Here it means
+      // "the required time elapsed after we sent you to YouTube".
       method = satisfied ? "PLATFORM_OBSERVED" : "UNVERIFIED";
       outcome = satisfied ? "VERIFIED" : "NOT_VERIFIED";
       if (!satisfied && watch) {
-        note = `تماشای ${watchPercent(watch.accumulatedSec, watch.durationSec)}٪ ثبت شده و به ${session.campaign.requiredWatchPercent}٪ نیاز است.`;
+        note = watch.openedAt
+          ? `${formatRemaining(remainingWatchSeconds(watch.openedAt, watch.requiredSec))} تا تأیید باقی مانده است.`
+          : "ابتدا ویدیو را در یوتیوب باز کنید تا زمان تماشا شروع شود.";
       }
-      detail = watch ? { accumulatedSec: watch.accumulatedSec, requiredSec: watch.requiredSec } : {};
+      detail = watch
+        ? {
+            requiredSec: watch.requiredSec,
+            elapsedSec: creditedWatchSeconds(watch.openedAt, watch.requiredSec),
+            openedAt: watch.openedAt?.toISOString() ?? null,
+          }
+        : {};
     } else if (task.type === "SUBSCRIBE_CHANNEL" && channelId) {
       const check = await checkSubscription(supporterId, channelId);
       satisfied = check.satisfied;
@@ -761,12 +787,12 @@ async function runCompletion(input: { sessionId: string; supporterId: string }) 
       const watch = session.watchSession;
       const elapsedSeconds = (Date.now() - session.startedAt.getTime()) / 1000;
 
-      // Real-time floor: even a client that spoofs positions perfectly cannot
-      // compress wall-clock time. A ten-minute requirement cannot be met in
-      // twenty seconds, whatever the segments say.
+      // Real-time gate, re-evaluated from the anchor at settlement rather than
+      // trusting the task row. The task was satisfied by a previous request, and
+      // this is the last point before money moves, so the requirement is proven
+      // again here: full requiredSec must have elapsed since the video was opened.
       if (watch && watch.requiredSec > 0) {
-        const floor = minimumElapsedSeconds(watch.requiredSec, WATCH_RULES.maxPlaybackRate);
-        if (elapsedSeconds < floor) {
+        if (!isTimerSatisfied(watch.openedAt, watch.requiredSec)) {
           await tx.supportSession.update({
             where: { id: session.id },
             data: { state: "FAILED", rewardState: "DENIED", failedAt: new Date(), failureCode: "IMPOSSIBLE_TIMELINE" },
@@ -778,7 +804,11 @@ async function runCompletion(input: { sessionId: string; supporterId: string }) 
               {
                 type: "IMPOSSIBLE_WATCH_SPEED",
                 severity: 10,
-                note: `session completed in ${Math.round(elapsedSeconds)}s, floor is ${Math.round(floor)}s`,
+                note: watch.openedAt
+                  ? `completed ${Math.round(
+                      remainingWatchSeconds(watch.openedAt, watch.requiredSec)
+                    )}s before the ${watch.requiredSec}s requirement elapsed`
+                  : "completed without ever opening the video",
               },
             ],
           });
@@ -786,15 +816,16 @@ async function runCompletion(input: { sessionId: string; supporterId: string }) 
         }
       }
 
+      // seekCount / heartbeats / rejectedBeats / hiddenSec are deliberately NOT
+      // passed: with the video on YouTube there is no player to observe, so those
+      // columns are structurally 0. Reporting 0 would make every honest watch look
+      // like a forged one to the heartbeat-anomaly rule, which is why
+      // assessSessionEvidence treats them as absent rather than zero.
       const evidenceReasons: RiskReason[] = watch
         ? assessSessionEvidence({
             elapsedSeconds,
-            watchedSeconds: watch.accumulatedSec,
+            watchedSeconds: creditedWatchSeconds(watch.openedAt, watch.requiredSec),
             requiredSeconds: watch.requiredSec,
-            seekCount: watch.seekCount,
-            heartbeats: watch.heartbeats,
-            rejectedBeats: watch.rejectedBeats,
-            hiddenSeconds: watch.hiddenSec,
             impossibleProgressEvents: await tx.abuseSignal.count({
               where: { sessionId: session.id, type: "CLIENT_TAMPERING" },
             }),
@@ -1385,17 +1416,21 @@ export async function reverseSupport(input: {
 }
 
 /**
- * Marks sessions that stopped sending heartbeats as abandoned, which both frees
- * the "one open session" slot and feeds the completion-rate metric honestly.
+ * Closes sessions that ran past their TTL, which frees the "one open session"
+ * slot and feeds the completion-rate metric honestly.
+ *
+ * The old heartbeat-staleness arm is gone with the heartbeats: a supporter who
+ * opens the video on YouTube and comes back twenty minutes later is behaving
+ * normally, and closing that session early would fail an honest watch. The TTL
+ * (WATCH_RULES.sessionTtlMinutes) is now the only bound.
  */
 export async function expireStaleSessions() {
-  const staleBefore = new Date(Date.now() - WATCH_RULES.staleAfterSeconds * 1000);
   const now = new Date();
 
   const stale = await prisma.supportSession.findMany({
     where: {
       state: { in: ["STARTED", "VIDEO_OPENED", "WATCHING", "WATCH_THRESHOLD_REACHED", "VERIFYING"] },
-      OR: [{ expiresAt: { lt: now } }, { watchSession: { lastHeartbeatAt: { lt: staleBefore } } }],
+      expiresAt: { lt: now },
     },
     select: { id: true, supporterId: true, expiresAt: true },
     take: 500,
@@ -1416,7 +1451,7 @@ export async function expireStaleSessions() {
     }
   });
 
-  logger.info("expired stale support sessions", { count: stale.length });
+  logger.info("expired timed-out support sessions", { count: stale.length });
   return stale.length;
 }
 

@@ -96,18 +96,18 @@ export function youtubeWatchUrl(videoId: string): string {
 }
 
 /**
- * Privacy-preserving embed origin. youtube-nocookie.com is what the CSP
- * frame-src allows, so an embed built any other way is blocked by design.
+ * Mobile deep link, so the YouTube app opens instead of the mobile web player.
+ *
+ * The `vnd.youtube:` scheme is what the Android/iOS app registers. It is returned
+ * for the client to try FIRST, with the canonical https URL as the fallback when
+ * no app handles it — a plain https link would open the site inside the browser
+ * even on a device that has the app installed.
+ *
+ * Not a substitute for validation: the id is already checked by the callers that
+ * produce it, and this only formats.
  */
-export function youtubeEmbedUrl(videoId: string, opts?: { origin?: string; enableJsApi?: boolean }): string {
-  const params = new URLSearchParams({
-    rel: "0",
-    modestbranding: "1",
-    playsinline: "1",
-  });
-  if (opts?.enableJsApi) params.set("enablejsapi", "1");
-  if (opts?.origin) params.set("origin", opts.origin);
-  return `https://www.youtube-nocookie.com/embed/${videoId}?${params.toString()}`;
+export function youtubeAppUrl(videoId: string): string {
+  return `vnd.youtube://${videoId}`;
 }
 
 export function youtubeThumbnailUrl(videoId: string, quality: "default" | "mq" | "hq" | "maxres" = "hq"): string {

@@ -4,10 +4,13 @@ import { test, expect, type Page } from "@playwright/test";
  * Support flow end-to-end.
  *
  * These tests exercise the honest parts of the flow — session creation, the
- * server-authoritative watch accounting, and the refusal to settle an
- * unsatisfied session — without pretending to watch a real YouTube video in CI.
- * The player itself is third-party and network-dependent, so watch progress is
- * driven through the heartbeat API exactly as the client does.
+ * server-authoritative watch timer, and the refusal to settle an unsatisfied
+ * session — without pretending to watch a real YouTube video in CI.
+ *
+ * The video is watched on youtube.com, so there is no player to drive here. What
+ * CAN be tested without leaving the app is the part that decides the reward: the
+ * timer anchor lives on the server, so a session that was just opened must report
+ * time remaining and must refuse to settle.
  *
  * Requires the dev seed (`npm run prisma:seed`).
  */
@@ -53,7 +56,7 @@ test.describe("support session", () => {
 
     const dialog = page.getByRole("dialog");
     await expect(dialog).toBeVisible();
-    await expect(dialog.getByText("پیشرفت تماشا")).toBeVisible();
+    await expect(dialog.getByRole("button", { name: /تماشا در یوتیوب/ })).toBeVisible();
     // The platform must not claim YouTube verified the watch.
     await expect(dialog.getByText("ثبت‌شده توسط پلتفرم").first()).toBeVisible();
     await expect(dialog.getByText("تأییدشده توسط یوتیوب")).toHaveCount(0);
@@ -81,7 +84,7 @@ test.describe("support session", () => {
     expect(body.success).toBe(false);
   });
 
-  test("seeking to the end credits no watch time", async ({ page }) => {
+  test("the watch timer cannot be short-circuited by the client", async ({ page }) => {
     const campaignId = await pickForeignCampaign(page, SUPPORTER.username);
     const token = await csrfToken(page);
 
@@ -90,19 +93,57 @@ test.describe("support session", () => {
       data: { campaignId },
     });
     expect(started.ok()).toBeTruthy();
-    const session = (await started.json()).data as { sessionId: string; requiredWatchSeconds: number };
+    const session = (await started.json()).data as {
+      sessionId: string;
+      requiredWatchSeconds: number;
+      openedAt: string | null;
+    };
+    expect(session.openedAt).toBeNull();
 
-    // Claim a large jump immediately: physically impossible, so it earns nothing.
-    const heartbeat = await page.request.post("/api/v1/support/heartbeat", {
+    // Open it, then immediately send every field a client might hope the server
+    // trusts. The schema takes only sessionId, so all of this is discarded.
+    const opened = await page.request.post("/api/v1/support/watch", {
       headers: { "x-csrf-token": token },
-      data: { sessionId: session.sessionId, position: 600, playerState: "PLAYING", sequence: 1 },
+      data: {
+        sessionId: session.sessionId,
+        elapsedSec: 99_999,
+        completed: true,
+        requiredSec: 1,
+        openedAt: "1999-01-01T00:00:00.000Z",
+      },
     });
-    expect(heartbeat.ok()).toBeTruthy();
-    const watch = (await heartbeat.json()).data as { accumulatedSec: number; satisfied: boolean };
-    expect(watch.accumulatedSec).toBe(0);
-    expect(watch.satisfied).toBe(false);
+    expect(opened.ok()).toBeTruthy();
+    const first = (await opened.json()).data as {
+      requiredSec: number;
+      remainingSec: number;
+      satisfied: boolean;
+      openedAt: string;
+    };
+    expect(first.satisfied).toBe(false);
+    expect(first.requiredSec).toBe(session.requiredWatchSeconds);
+    expect(first.remainingSec).toBeGreaterThan(0);
 
-    // And settlement is refused.
+    // Opening again must reuse the same anchor: a refresh cannot restart the clock.
+    const reopened = await page.request.post("/api/v1/support/watch", {
+      headers: { "x-csrf-token": token },
+      data: { sessionId: session.sessionId },
+    });
+    const second = (await reopened.json()).data as { openedAt: string; satisfied: boolean };
+    expect(second.openedAt).toBe(first.openedAt);
+    expect(second.satisfied).toBe(false);
+
+    // Polling the status repeatedly credits nothing extra.
+    for (let i = 0; i < 3; i += 1) {
+      const status = await page.request.patch("/api/v1/support/watch", {
+        headers: { "x-csrf-token": token },
+        data: { sessionId: session.sessionId },
+      });
+      const body = (await status.json()).data as { satisfied: boolean; elapsedSec: number };
+      expect(body.satisfied).toBe(false);
+      expect(body.elapsedSec).toBeLessThan(session.requiredWatchSeconds);
+    }
+
+    // And settlement is refused while time remains.
     const complete = await page.request.post("/api/v1/support/complete", {
       headers: { "x-csrf-token": token },
       data: { sessionId: session.sessionId },
@@ -110,7 +151,7 @@ test.describe("support session", () => {
     expect(complete.ok()).toBeFalsy();
   });
 
-  test("the heartbeat endpoint rejects another user's session", async ({ page, browser }) => {
+  test("the watch endpoint rejects another user's session", async ({ page, browser }) => {
     const campaignId = await pickForeignCampaign(page, SUPPORTER.username);
     const started = await page.request.post("/api/v1/support/sessions", {
       headers: { "x-csrf-token": await csrfToken(page) },
@@ -121,9 +162,9 @@ test.describe("support session", () => {
     const otherContext = await browser.newContext();
     const otherPage = await otherContext.newPage();
     await signIn(otherPage, "creator_3", "MemberPass2026!");
-    const response = await otherPage.request.post("/api/v1/support/heartbeat", {
+    const response = await otherPage.request.post("/api/v1/support/watch", {
       headers: { "x-csrf-token": await csrfToken(otherPage) },
-      data: { sessionId: session.sessionId, position: 10, playerState: "PLAYING", sequence: 1 },
+      data: { sessionId: session.sessionId },
     });
     // Ownership is checked server-side, not inferred from the client.
     expect([403, 404]).toContain(response.status());

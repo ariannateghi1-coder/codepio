@@ -259,18 +259,25 @@ export const BADGE_REQUIREMENTS: Record<BadgeCode, { metric: BadgeMetric; thresh
 };
 
 /** Watch-verification defaults. */
+/**
+ * Watch requirement.
+ *
+ * The video is watched on YouTube itself, not in an embedded player, so there is
+ * no player state to observe: completion is decided purely by elapsed server
+ * time since the supporter opened the video. `requiredPercent` is therefore a
+ * fixed platform constant rather than a per-campaign choice — a campaign that
+ * could ask for less would buy the same support for less watching.
+ *
+ * This system does NOT claim YouTube told us how much was watched. It claims
+ * only that the required amount of time passed after the video was opened.
+ */
 export const WATCH_RULES = {
-  defaultRequiredPercent: 90,
+  /** Share of the video's duration that must elapse. requiredSec = ceil(d * 0.99). */
+  defaultRequiredPercent: 99,
   minRequiredPercent: 50,
   maxRequiredPercent: 100,
-  /** Client heartbeat cadence; the server validates the interval it observes. */
-  heartbeatSeconds: 10,
-  /** Credited progress per heartbeat is capped at this multiple of wall time. */
-  maxPlaybackRate: 1.25,
   /** A session must be finished within this window. */
   sessionTtlMinutes: 90,
-  /** Missing heartbeats for longer than this marks the session abandoned. */
-  staleAfterSeconds: 180,
 } as const;
 
 /** Risk thresholds mapping a session's risk score to a reward decision. */

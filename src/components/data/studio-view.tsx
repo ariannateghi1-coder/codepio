@@ -6,14 +6,14 @@ import { Plus, RefreshCw, Trash2, Youtube } from "lucide-react";
 import { api, errorMessage, fieldErrors } from "@/lib/client-api";
 import { Button } from "@/components/ui/button";
 import { Card, CardBody, CardFooter, CardHeader, CardMedia, CardTitle } from "@/components/ui/card";
-import { Field, Input, Select, Switch } from "@/components/ui/field";
+import { Field, Input, Switch } from "@/components/ui/field";
 import { Pill } from "@/components/ui/badge";
 import { Modal } from "@/components/ui/modal";
 import { Alert, EmptyState, ErrorState } from "@/components/ui/states";
 import { Section } from "@/components/layout/page";
 import { useToast } from "@/components/ui/toast";
 import { formatDuration, formatNumber, formatRelativeTime } from "@/lib/cn";
-import { SUPPORT_TRANSFER_CREDITS } from "@/lib/gamification";
+import { SUPPORT_TRANSFER_CREDITS, WATCH_RULES } from "@/lib/gamification";
 
 /**
  * Creator studio: videos and campaigns.
@@ -408,9 +408,8 @@ function CreateCampaignModal({
         description: String(form.get("description") ?? ""),
         startAt: new Date().toISOString(),
         endAt: new Date(Date.now() + Number(form.get("days") ?? 30) * 86_400_000).toISOString(),
-        requiredWatchPercent: Number(form.get("requiredWatchPercent") ?? 90),
-        // No rewardCredits: the per-support credit amount is a platform constant,
-        // identical for every campaign, and the API rejects the field.
+        // No rewardCredits and no requiredWatchPercent: both are platform
+        // constants, identical for every campaign, and the API rejects the fields.
         rewardXp: 25,
         budgetCredits: Number(form.get("budgetCredits")),
         maxSupportsPerUser: 1,
@@ -447,15 +446,12 @@ function CreateCampaignModal({
         </Field>
 
         <div className="grid gap-4 sm:grid-cols-2">
-          <Field label="درصد تماشای لازم" htmlFor="requiredWatchPercent" error={fields.requiredWatchPercent}>
-            <Select id="requiredWatchPercent" name="requiredWatchPercent" defaultValue="90">
-              {[50, 60, 70, 80, 90, 100].map((value) => (
-                <option key={value} value={value}>
-                  {value}٪
-                </option>
-              ))}
-            </Select>
-          </Field>
+          {/* The watch requirement is not a creator choice: every campaign asks
+              for the same share of the video, so there is nothing to select. */}
+          <div className="rounded-lg bg-surface-sunken p-3 text-xs leading-6 text-fg-muted">
+            حامیان باید <span className="numeric font-bold">{formatNumber(WATCH_RULES.defaultRequiredPercent)}٪</span> از مدت ویدیو را
+            تماشا کنند. ویدیو در خود یوتیوب باز می‌شود و زمان لازم روی ساعت سرور اندازه‌گیری می‌شود.
+          </div>
 
           <Field
             label="بودجه کل (اعتبار)"

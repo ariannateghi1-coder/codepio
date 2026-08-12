@@ -10,8 +10,8 @@ import {
   registerSchema,
   reportSchema,
   usernameSchema,
+  supportWatchSchema,
   videoSchema,
-  watchHeartbeatSchema,
 } from "@/lib/validators";
 
 /** Helper: does this schema accept the value? */
@@ -170,8 +170,10 @@ describe("campaignCreateSchema", () => {
 
   it("accepts a minimal valid campaign and applies defaults", () => {
     const parsed = campaignCreateSchema.parse(base);
-    expect(parsed.requiredWatchPercent).toBe(90);
     expect(parsed.rewardXp).toBe(25);
+    // No watch-percentage default asserted here on purpose: the requirement is no
+    // longer part of the campaign payload at all, it is a platform constant applied
+    // server-side. See "ignores a client-supplied watch requirement" below.
   });
 
   it("requires the end date after the start date", () => {
@@ -202,22 +204,39 @@ describe("campaignCreateSchema", () => {
     ).toBe(false);
   });
 
-  it("bounds the watch percentage and the XP reward", () => {
-    expect(ok(campaignCreateSchema, { ...base, requiredWatchPercent: 10 })).toBe(false);
-    expect(ok(campaignCreateSchema, { ...base, requiredWatchPercent: 150 })).toBe(false);
+  it("bounds the XP reward", () => {
     expect(ok(campaignCreateSchema, { ...base, rewardXp: 0 })).toBe(false);
     expect(ok(campaignCreateSchema, { ...base, rewardXp: 9999 })).toBe(false);
   });
+
+  it("ignores a client-supplied watch requirement", () => {
+    // The watch requirement is a platform constant. A campaign that could ask for
+    // 50% would buy the same support for half the watching, so the field is
+    // stripped rather than validated.
+    const parsed = campaignCreateSchema.parse({ ...base, requiredWatchPercent: 50 });
+    expect("requiredWatchPercent" in parsed).toBe(false);
+  });
 });
 
-describe("watchHeartbeatSchema", () => {
-  it("bounds the reported position", () => {
-    const valid = { sessionId: "clx0000000000000000000", position: 42, playerState: "PLAYING", sequence: 1 };
-    expect(ok(watchHeartbeatSchema, valid)).toBe(true);
-    expect(ok(watchHeartbeatSchema, { ...valid, sequence: undefined })).toBe(false);
-    expect(ok(watchHeartbeatSchema, { ...valid, position: -1 })).toBe(false);
-    expect(ok(watchHeartbeatSchema, { ...valid, position: 1_000_000 })).toBe(false);
-    expect(ok(watchHeartbeatSchema, { ...valid, playerState: "HACKED" })).toBe(false);
+describe("supportWatchSchema", () => {
+  it("accepts a session id and nothing else", () => {
+    expect(ok(supportWatchSchema, { sessionId: "clx0000000000000000000" })).toBe(true);
+    expect(ok(supportWatchSchema, {})).toBe(false);
+    expect(ok(supportWatchSchema, { sessionId: "not-a-cuid" })).toBe(false);
+  });
+
+  it("strips every field a client could use to forge progress", () => {
+    // There is no elapsed time, no position and no completion flag to send: the
+    // anchor and the clock are both server-side.
+    const parsed = supportWatchSchema.parse({
+      sessionId: "clx0000000000000000000",
+      elapsedSec: 99_999,
+      completed: true,
+      requiredSec: 1,
+      position: 600,
+      openedAt: "1999-01-01T00:00:00.000Z",
+    });
+    expect(parsed).toEqual({ sessionId: "clx0000000000000000000" });
   });
 });
 

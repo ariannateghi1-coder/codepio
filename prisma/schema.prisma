@@ -514,7 +514,12 @@ model Campaign {
   minAccountAgeHours Int  @default(0)
   /// Creator-set exposure priority, clamped server-side.
   priority           Int  @default(0)
-  requiredWatchPercent Int @default(90)
+  /// LEGACY. The watch requirement is now the platform constant
+  /// WATCH_RULES.defaultRequiredPercent (99%), applied uniformly, and requiredSec
+  /// is derived server-side from the duration YouTube reported. The column is kept
+  /// so historical campaigns still show the percentage they ran under; nothing
+  /// reads it to decide a current requirement.
+  requiredWatchPercent Int @default(99)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -630,9 +635,25 @@ model WatchSession {
   videoId       String?
   durationSec   Int
   requiredSec   Int
+  /// TIMER ANCHOR — the instant the supporter opened the video on YouTube.
+  ///
+  /// The watch flow sends the supporter to youtube.com instead of embedding a
+  /// player, so there is no playback to observe and completion is decided purely
+  /// by elapsed server time since this instant. Written ONCE with a conditional
+  /// update (WHERE "openedAt" IS NULL), so a refresh, a double click or a
+  /// replayed request can neither restart the clock nor run two timers for one
+  /// session. Null means the video was never opened, which can never be
+  /// satisfied — that is what stops a client from skipping to completion.
+  openedAt      DateTime?
   accumulatedSec Int      @default(0)
-  /// Merged, non-overlapping watched ranges: [[from, to], ...] in seconds.
+  /// LEGACY (segment-tracking era). No longer written: the current flow opens
+  /// the video on YouTube, so there are no player events to segment. Kept so the
+  /// rows already recorded stay readable and so an in-page player could return.
   segments      Json      @default("[]")
+  /// LEGACY, as above: these five columns were fed by the in-page player's
+  /// heartbeats. They are structurally 0 for sessions created by the timer flow,
+  /// which is why the risk engine treats the playback signals as ABSENT rather
+  /// than as zero — see assessSessionEvidence.
   playerState   String    @default("IDLE")
   heartbeats    Int       @default(0)
   maxRate       Float     @default(1)

@@ -6,7 +6,7 @@ import { NotFoundError, BusinessRuleError } from "@/lib/errors";
 import { writeAudit } from "@/lib/audit";
 import { debitBudget, endCampaignWithRefund, estimateSupports } from "@/lib/services/budget";
 import { ledgerKey, recordCredit } from "@/lib/services/ledger";
-import { SUPPORT_TRANSFER_CREDITS } from "@/lib/gamification";
+import { SUPPORT_TRANSFER_CREDITS, WATCH_RULES } from "@/lib/gamification";
 
 /**
  * Creator campaign management.
@@ -108,7 +108,9 @@ export const POST = active(
           startAt: data.startAt,
           endAt: data.endAt,
           status: "ACTIVE",
-          requiredWatchPercent: data.requiredWatchPercent,
+          // Platform constant, not client input: every campaign requires the same
+          // share of the video, and requiredSec is derived server-side per session.
+          requiredWatchPercent: WATCH_RULES.defaultRequiredPercent,
           // Fixed platform transfer, not client input: every campaign pays the
           // same amount per support and is charged that same amount.
           rewardCredits: SUPPORT_TRANSFER_CREDITS,

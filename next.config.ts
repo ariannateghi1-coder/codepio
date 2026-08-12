@@ -6,9 +6,12 @@ const isProd = process.env.NODE_ENV === "production";
  * Content Security Policy.
  *
  * Scoped to the origins the app actually talks to, nothing more:
- *   frame-src   — youtube-nocookie only, which is why every embed must be built
- *                 through youtubeEmbedUrl(); a youtube.com embed is blocked.
- *   script-src  — self plus the IFrame Player API. 'unsafe-inline' is required
+ *   frame-src   — 'none'. The watch flow opens the video on YouTube itself in a
+ *                 new tab, so the app embeds no third-party frame at all. This is
+ *                 strictly tighter than the previous youtube-nocookie allowance.
+ *   script-src  — self only. The IFrame Player API is no longer loaded, because
+ *                 the video is watched on YouTube rather than in the page.
+ *                 'unsafe-inline' is required
  *                 twice over: by the pre-paint theme script in layout.tsx, and
  *                 by the inline bootstrap scripts the App Router streams on
  *                 every response (`self.__next_f.push(...)`), which carry the
@@ -34,10 +37,10 @@ const csp = [
   "frame-ancestors 'none'",
   "object-src 'none'",
   "img-src 'self' data: blob: https://i.ytimg.com https://*.ytimg.com https://*.googleusercontent.com https://yt3.ggpht.com",
-  `script-src 'self' 'unsafe-inline'${isProd ? "" : " 'unsafe-eval'"} https://www.youtube.com https://s.ytimg.com`,
+  `script-src 'self' 'unsafe-inline'${isProd ? "" : " 'unsafe-eval'"}`,
   "style-src 'self' 'unsafe-inline'",
   "font-src 'self' data:",
-  "frame-src https://www.youtube-nocookie.com",
+  "frame-src 'none'",
   "media-src 'self' https://*.googlevideo.com",
   "connect-src 'self' https://*.ably.io https://*.ably-realtime.com wss://*.ably.io wss://*.ably-realtime.com https://www.googleapis.com",
   "worker-src 'self'",

@@ -3,15 +3,19 @@ import {
   applyHeartbeat,
   boundedElapsed,
   checkSequence,
+  creditedWatchSeconds,
+  isTimerSatisfied,
   isWatchSatisfied,
   mergeSegments,
   minimumElapsedSeconds,
   parseSegments,
+  remainingWatchSeconds,
   requiredWatchSeconds,
   segmentsTotal,
   watchPercent,
   type Segment,
 } from "@/lib/services/watch";
+import { WATCH_RULES } from "@/lib/gamification";
 
 /**
  * Watch accounting is the anti-abuse core: these tests encode the rule that
@@ -184,6 +188,85 @@ describe("applyHeartbeat", () => {
     }
     expect(segmentsTotal(segments)).toBeCloseTo(600);
     expect(isWatchSatisfied(segmentsTotal(segments), 600, 90)).toBe(true);
+  });
+});
+
+/**
+ * The timer model is what the live watch flow uses. These tests pin the two
+ * properties the reward depends on: the requirement is 99% of the real duration,
+ * and satisfaction is a function of the server anchor alone.
+ */
+describe("watch requirement — 99% of duration", () => {
+  it("is ceil(duration * 0.99), as specified", () => {
+    const percent = WATCH_RULES.defaultRequiredPercent;
+    expect(percent).toBe(99);
+    expect(requiredWatchSeconds(600, percent)).toBe(594);
+    expect(requiredWatchSeconds(300, percent)).toBe(297);
+  });
+
+  it("rounds up rather than down, so a short watch never passes on rounding", () => {
+    // 213 * 0.99 = 210.87 → 211, not 210.
+    expect(requiredWatchSeconds(213, 99)).toBe(211);
+    expect(requiredWatchSeconds(101, 99)).toBe(100);
+  });
+});
+
+describe("isTimerSatisfied", () => {
+  const now = new Date("2026-08-16T12:00:00.000Z");
+  const ago = (seconds: number) => new Date(now.getTime() - seconds * 1000);
+
+  it("is false until the full requirement has elapsed", () => {
+    expect(isTimerSatisfied(ago(593), 594, now)).toBe(false);
+    expect(isTimerSatisfied(ago(594), 594, now)).toBe(true);
+    expect(isTimerSatisfied(ago(600), 594, now)).toBe(true);
+  });
+
+  it("is never satisfied when the video was never opened", () => {
+    // This is the property that stops a client from skipping straight to done.
+    expect(isTimerSatisfied(null, 594, now)).toBe(false);
+    expect(isTimerSatisfied(undefined, 594, now)).toBe(false);
+  });
+
+  it("is not satisfied by a nonsensical requirement", () => {
+    expect(isTimerSatisfied(ago(10_000), 0, now)).toBe(false);
+    expect(isTimerSatisfied(ago(10_000), Number.NaN, now)).toBe(false);
+  });
+
+  it("cannot be satisfied by an anchor in the future", () => {
+    expect(isTimerSatisfied(new Date(now.getTime() + 60_000), 594, now)).toBe(false);
+  });
+});
+
+describe("remainingWatchSeconds", () => {
+  const now = new Date("2026-08-16T12:00:00.000Z");
+  const ago = (seconds: number) => new Date(now.getTime() - seconds * 1000);
+
+  it("counts down and stops at zero", () => {
+    expect(remainingWatchSeconds(ago(0), 594, now)).toBe(594);
+    expect(remainingWatchSeconds(ago(394), 594, now)).toBe(200);
+    expect(remainingWatchSeconds(ago(594), 594, now)).toBe(0);
+    expect(remainingWatchSeconds(ago(5_000), 594, now)).toBe(0);
+  });
+
+  it("reports the whole requirement before the video is opened", () => {
+    expect(remainingWatchSeconds(null, 594, now)).toBe(594);
+  });
+});
+
+describe("creditedWatchSeconds", () => {
+  const now = new Date("2026-08-16T12:00:00.000Z");
+  const ago = (seconds: number) => new Date(now.getTime() - seconds * 1000);
+
+  it("never exceeds the requirement, however long the tab stayed open", () => {
+    expect(creditedWatchSeconds(ago(10_000), 594, now)).toBe(594);
+  });
+
+  it("never exceeds elapsed real time", () => {
+    expect(creditedWatchSeconds(ago(120), 594, now)).toBe(120);
+  });
+
+  it("is zero before the video is opened", () => {
+    expect(creditedWatchSeconds(null, 594, now)).toBe(0);
   });
 });
 

@@ -47,8 +47,15 @@ export type SessionEvidence = {
   /** Seconds of unique timeline actually covered. */
   watchedSeconds: number;
   requiredSeconds: number;
-  seekCount: number;
-  heartbeats: number;
+  /**
+   * Playback-shape signals. OPTIONAL because the current watch flow opens the
+   * video on YouTube and therefore observes no player: there are no seeks and no
+   * heartbeats to count. Passing 0 would be a lie the scorer would act on — a
+   * genuine 594-second watch with 0 heartbeats looks exactly like a forged one —
+   * so an absent signal is skipped instead of scored.
+   */
+  seekCount?: number;
+  heartbeats?: number;
   impossibleProgressEvents: number;
   /** Heartbeats refused as replayed or out-of-order. */
   rejectedBeats?: number;
@@ -81,18 +88,24 @@ export function assessSessionEvidence(evidence: SessionEvidence): RiskReason[] {
   }
 
   // Excessive seeking with just-enough coverage is the classic scrub pattern.
-  if (evidence.seekCount >= 8 && evidence.watchedSeconds < evidence.requiredSeconds * 1.05) {
+  if (
+    evidence.seekCount !== undefined &&
+    evidence.seekCount >= 8 &&
+    evidence.watchedSeconds < evidence.requiredSeconds * 1.05
+  ) {
     reasons.push({ type: "SEEK_JUMP_ABUSE", severity: 4, note: `${evidence.seekCount} seeks with minimal coverage` });
   }
 
   // Far fewer heartbeats than a genuine watch of this length would produce.
-  const expectedHeartbeats = Math.floor(evidence.watchedSeconds / 20);
-  if (expectedHeartbeats > 3 && evidence.heartbeats < expectedHeartbeats / 2) {
-    reasons.push({
-      type: "HEARTBEAT_ANOMALY",
-      severity: 5,
-      note: `${evidence.heartbeats} heartbeats for ${Math.round(evidence.watchedSeconds)}s of credited watch time`,
-    });
+  if (evidence.heartbeats !== undefined) {
+    const expectedHeartbeats = Math.floor(evidence.watchedSeconds / 20);
+    if (expectedHeartbeats > 3 && evidence.heartbeats < expectedHeartbeats / 2) {
+      reasons.push({
+        type: "HEARTBEAT_ANOMALY",
+        severity: 5,
+        note: `${evidence.heartbeats} heartbeats for ${Math.round(evidence.watchedSeconds)}s of credited watch time`,
+      });
+    }
   }
 
   // Repeated stale/duplicate sequence numbers. A couple can happen on a flaky

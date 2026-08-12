@@ -38,7 +38,13 @@ describe("progress transitions", () => {
   it("refuses to skip the watch threshold", () => {
     expect(canTransition("STARTED", "COMPLETED")).toBe(false);
     expect(canTransition("WATCHING", "COMPLETED")).toBe(false);
-    expect(canTransition("VIDEO_OPENED", "VERIFYING")).toBe(false);
+    // VIDEO_OPENED → VERIFYING is legal now: with the video on YouTube there is
+    // no heartbeat to move the session through WATCHING, so the states after
+    // opening are the timer crossing and verification.
+    expect(canTransition("VIDEO_OPENED", "WATCH_THRESHOLD_REACHED")).toBe(true);
+    expect(canTransition("VIDEO_OPENED", "VERIFYING")).toBe(true);
+    // Still illegal: opening a video can never settle it.
+    expect(canTransition("VIDEO_OPENED", "COMPLETED")).toBe(false);
   });
 
   it("keeps the threshold sticky, so a later heartbeat cannot un-reach it", () => {

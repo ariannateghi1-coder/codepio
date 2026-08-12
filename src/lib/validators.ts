@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { extractYoutubeVideoId, isValidYoutubeChannelId } from "./youtube";
-import { SUPPORT_TRANSFER_CREDITS, WATCH_RULES } from "./gamification";
+import { SUPPORT_TRANSFER_CREDITS } from "./gamification";
 
 /**
  * Validation layer.
@@ -145,12 +145,13 @@ export const campaignCreateSchema = z
     description: cleanText(1000).optional().nullable(),
     startAt: z.coerce.date(),
     endAt: z.coerce.date(),
-    requiredWatchPercent: z.coerce
-      .number()
-      .int()
-      .min(WATCH_RULES.minRequiredPercent)
-      .max(WATCH_RULES.maxRequiredPercent)
-      .default(WATCH_RULES.defaultRequiredPercent),
+    /**
+     * NOTE: there is deliberately NO requiredWatchPercent field either. The watch
+     * requirement is the platform constant WATCH_RULES.defaultRequiredPercent and
+     * requiredSec is derived server-side from the video duration YouTube reported.
+     * Accepting it from the client would let a campaign buy the same support for
+     * less watching, and would let the client shorten its own requirement.
+     */
     /**
      * NOTE: there is deliberately NO rewardCredits field. The credit a supporter
      * receives is the platform constant SUPPORT_TRANSFER_CREDITS, and it is the
@@ -235,19 +236,14 @@ export const campaignUpdateSchema = z
 
 export const supportStartSchema = z.object({ campaignId: cuidSchema });
 
-export const watchHeartbeatSchema = z.object({
-  sessionId: cuidSchema,
-  position: z.coerce.number().min(0).max(86_400),
-  playerState: z.enum(["PLAYING", "PAUSED", "BUFFERING", "ENDED", "IDLE"]),
-  /** Required monotonic counter assigned by the client, starting at 1. */
-  sequence: z.coerce.number().int().min(1).max(100_000),
-  /**
-   * Seconds the page was hidden since the previous beat (Page Visibility API).
-   * Advisory only — a hostile client can under-report it, so it feeds the risk
-   * score and never gates the reward by itself.
-   */
-  hiddenSec: z.coerce.number().min(0).max(3_600).optional(),
-});
+/**
+ * Opening the video, and asking for the watch timer's state.
+ *
+ * The body carries the session id and NOTHING else. There is deliberately no
+ * elapsed time, no position and no `completed` flag: the anchor and the clock
+ * are both server-side, so there is no client-supplied number here to forge.
+ */
+export const supportWatchSchema = z.object({ sessionId: cuidSchema });
 
 export const supportCompleteSchema = z.object({ sessionId: cuidSchema });
 
