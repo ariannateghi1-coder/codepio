@@ -1,0 +1,23 @@
+{
+  "name": "آکادمی حمایت",
+  "short_name": "آکادمی",
+  "description": "کشف سازندگان، حمایت واقعی و تأییدشده، ساختن اعتبار.",
+  "lang": "fa",
+  "dir": "rtl",
+  "start_url": "/explore",
+  "scope": "/",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#0e1119",
+  "theme_color": "#6366f1",
+  "icons": [
+    { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ],
+  "shortcuts": [
+    { "name": "کاوش", "url": "/explore" },
+    { "name": "داشبورد", "url": "/dashboard" },
+    { "name": "استودیو", "url": "/studio" }
+  ]
+}

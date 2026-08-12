@@ -1,0 +1,916 @@
+// Academy Support — Support Exchange / Social Discovery Platform
+//
+// Core product loop this schema is built around:
+//   CREATE CONTENT → CREATE CAMPAIGN → ENTER EXPLORE → DISCOVERY →
+//   START SUPPORT → WATCH → SUBSCRIBE → LIKE → (COMMENT) →
+//   SERVER VERIFICATION → ANTI-ABUSE → COMPLETED →
+//   CREDITS + XP + REPUTATION → EXPOSURE → LOOP
+//
+// Four separate economies, deliberately NOT merged into one number:
+//   credits    — spendable/earnable economy      (source of truth: CreditLedger)
+//   points     — XP / progression, drives level   (source of truth: XpLedger)
+//   reputation — trust & quality, drives exposure (source of truth: ReputationEvent)
+//   trustScore — internal anti-abuse score, never shown raw to the user
+//
+// Every mutation of the first three MUST go through a ledger entry so that a
+// reversal is an accounting operation, not a raw `points -= x`.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  USER
+  MODERATOR
+  ADMIN
+  SUPER_ADMIN
+}
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+  BANNED
+}
+
+enum RankTier {
+  BRONZE
+  SILVER
+  GOLD
+  PLATINUM
+  DIAMOND
+  ELITE
+}
+
+enum VideoStatus {
+  ACTIVE
+  HIDDEN
+  REMOVED
+}
+
+enum SupportStatus {
+  ACTIVE
+  REVERSED
+}
+
+enum CampaignStatus {
+  DRAFT
+  ACTIVE
+  PAUSED
+  ENDED
+}
+
+/// What a campaign asks a supporter to actually do.
+enum TaskType {
+  WATCH_VIDEO
+  SUBSCRIBE_CHANNEL
+  LIKE_VIDEO
+  COMMENT_VIDEO
+}
+
+/// Lifecycle of one supporter's attempt at one campaign.
+enum SupportSessionState {
+  STARTED
+  VIDEO_OPENED
+  WATCHING
+  WATCH_THRESHOLD_REACHED
+  VERIFYING
+  COMPLETED
+  FAILED
+  EXPIRED
+  ABANDONED
+}
+
+enum SupportTaskState {
+  IN_PROGRESS
+  SATISFIED
+  FAILED
+  SKIPPED
+}
+
+/// How strongly a task's completion is actually proven. Surfaced verbatim in
+/// the UI — the product must never label something "Verified by YouTube" when
+/// it was only observed in the browser.
+enum VerificationMethod {
+  YOUTUBE_API
+  PLATFORM_OBSERVED
+  SELF_REPORTED
+  UNVERIFIED
+}
+
+enum VerificationResult {
+  PASSED
+  FAILED
+  INCONCLUSIVE
+}
+
+/// Whether the reward for a session has been paid, held for review, or clawed back.
+enum RewardState {
+  NONE_REVIEW
+  CONFIRMED
+  DENIED
+  REVERSED
+}
+
+enum CreditEntryType {
+  SUPPORT_COMPLETED
+  SUPPORT_RECEIVED
+  MUTUAL_BONUS
+  CAMPAIGN_BONUS
+  REFERRAL
+  BADGE_REWARD
+  ADMIN_ADJUSTMENT
+  CAMPAIGN_BUDGET_SPEND
+  REVERSAL
+  PENALTY
+}
+
+enum XpEntryType {
+  SUPPORT_COMPLETED
+  SUPPORT_RECEIVED
+  MUTUAL_BONUS
+  STREAK
+  BADGE_REWARD
+  REFERRAL
+  ADMIN_ADJUSTMENT
+  REVERSAL
+  PENALTY
+}
+
+enum ReputationEventType {
+  SUPPORT_VERIFIED
+  SUPPORT_PARTIAL
+  SUPPORT_REVERSED
+  ABUSE_SIGNAL
+  REPORT_UPHELD
+  REPORT_DISMISSED
+  CAMPAIGN_COMPLETED
+  ACCOUNT_AGE
+  CHANNEL_VERIFIED
+  ADMIN_ADJUSTMENT
+}
+
+enum AbuseSignalType {
+  IMPOSSIBLE_WATCH_SPEED
+  SEEK_JUMP_ABUSE
+  HEARTBEAT_ANOMALY
+  HEARTBEAT_REPLAY
+  BACKGROUND_WATCH
+  SUPPORT_VELOCITY
+  RECIPROCAL_LOOP
+  FARMING_RING
+  PAIR_FARMING
+  SELF_SUPPORT_ATTEMPT
+  REFERRAL_ABUSE
+  DUPLICATE_DEVICE
+  ACCOUNT_TOO_NEW
+  SUBSCRIPTION_CHURN
+  CLIENT_TAMPERING
+}
+
+/// Lifecycle of a YouTube OAuth grant. An explicit state is what stops the app
+/// from retrying a permanently dead grant forever, and lets the UI say precisely
+/// what the user must do.
+enum YoutubeConnectionState {
+  /// Usable now, or refreshable with the stored refresh token.
+  CONNECTED
+  /// Access token expired and no refresh token is available.
+  EXPIRED
+  /// The grant was revoked or refused (invalid_grant), or scopes are missing.
+  /// Only the user can fix this, by reconnecting.
+  REAUTH_REQUIRED
+  /// The user disconnected deliberately.
+  DISCONNECTED
+  /// Repeated non-authorization failures (provider outage, quota). Retryable.
+  ERROR
+}
+
+enum LeaderboardPeriod {
+  WEEKLY
+  MONTHLY
+  ALL_TIME
+}
+
+enum LeaderboardMode {
+  TOP_SUPPORTERS
+  TOP_CREATORS
+  HIGHEST_REPUTATION
+  RISING
+}
+
+enum NotificationType {
+  SUPPORT_RECEIVED
+  SUPPORT_BACK_AVAILABLE
+  SUPPORT_MUTUAL
+  SUPPORT_VERIFIED
+  SUPPORT_REVERSED
+  REWARD_PENDING
+  NEW_VIDEO
+  CAMPAIGN_UPDATE
+  ANNOUNCEMENT
+  MENTION
+  SECURITY
+  SYSTEM
+}
+
+enum DeliveryStatus {
+  SENT
+  FAILED
+  READ
+}
+
+enum ActivityType {
+  SUPPORT_CREATED
+  SUPPORT_RECEIVED
+  MUTUAL_SUPPORT
+  SUPPORT_REVERSED
+  VIDEO_ADDED
+  CAMPAIGN_CREATED
+  BADGE_EARNED
+  LEVEL_UP
+  RANK_UP
+  CAMPAIGN_JOINED
+}
+
+enum ReportStatus {
+  OPEN
+  UNDER_REVIEW
+  RESOLVED
+  DISMISSED
+}
+
+enum ReportTargetType {
+  USER
+  VIDEO
+  SUPPORT
+  CAMPAIGN
+}
+
+enum AuditAction {
+  CREATE
+  UPDATE
+  DELETE
+  LOGIN
+  LOGOUT
+  SUPPORT
+  SUPPORT_REVERSAL
+  NOTIFICATION
+  ADMIN_ACTION
+  SECURITY
+  LEDGER_ADJUSTMENT
+}
+
+model User {
+  id       String @id @default(cuid())
+  username String @unique
+  email    String @unique
+
+  passwordHash String
+  name         String
+  avatarUrl    String?
+  bio          String?
+  country      String?
+  language     String @default("fa")
+
+  role   Role       @default(USER)
+  status UserStatus @default(ACTIVE)
+
+  youtubeVerified Boolean @default(false)
+
+  /// XP total. Invariant: equals SUM(XpLedger.amount) for this user.
+  points Int @default(0)
+  level  Int @default(1)
+  /// Spendable credits. Invariant: equals SUM(CreditLedger.amount) for this user.
+  credits Int @default(0)
+  /// Trust/quality score (0..1000, seeded at 100). Drives Explore exposure.
+  reputation Int @default(100)
+  /// Internal anti-abuse score (0..100). Never rendered raw in the UI.
+  trustScore Int      @default(50)
+  rankTier   RankTier @default(BRONZE)
+
+  /// Rolling completion quality, cached from SupportSession outcomes so Explore
+  /// ranking doesn't have to aggregate sessions on every request.
+  supportsCompleted Int @default(0)
+  supportsAbandoned Int @default(0)
+  currentStreakDays Int @default(0)
+  longestStreakDays Int @default(0)
+  lastStreakDay     DateTime?
+
+  referralCode String    @unique
+  lastActiveAt DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  sessions           Session[]
+  youtubeConnection  YoutubeConnection?
+  youtubeAccount     YoutubeAccount?
+  videos             Video[]
+  campaigns          Campaign[]          @relation("campaignCreator")
+  supportsGiven      Support[]           @relation("supportsGiven")
+  supportsReceived   Support[]           @relation("supportsReceived")
+  supportSessions    SupportSession[]    @relation("sessionSupporter")
+  receivedSessions   SupportSession[]    @relation("sessionCreator")
+  creditEntries      CreditLedger[]
+  xpEntries          XpLedger[]
+  reputationEvents   ReputationEvent[]
+  abuseSignals       AbuseSignal[]
+  notifications      Notification[]      @relation("userNotifications")
+  actorNotifications Notification[]      @relation("actorNotifications")
+  activities         Activity[]          @relation("userActivities")
+  actorActivities    Activity[]          @relation("actorActivities")
+  badges             UserBadge[]
+  referralsMade      Referral[]          @relation("referrer")
+  referredBy         Referral[]          @relation("referred")
+  reportsMade        Report[]            @relation("reportsMade")
+  reportsResolved    Report[]            @relation("reportsResolved")
+  pushSubscriptions  PushSubscription[]
+  auditLogs          AuditLog[]
+  pairsAsSupporter   SupportPair[]       @relation("pairSupporter")
+  pairsAsReceiver    SupportPair[]       @relation("pairReceiver")
+  leaderboardRows    LeaderboardSnapshot[]
+
+  @@index([points(sort: Desc)])
+  @@index([credits(sort: Desc)])
+  @@index([reputation(sort: Desc)])
+  @@index([status])
+  @@index([status, createdAt])
+  @@index([role])
+}
+
+model Session {
+  id            String    @id @default(cuid())
+  userId        String
+  tokenHash     String    @unique
+  csrfTokenHash String
+  userAgent     String?
+  ipHash        String?
+  lastSeenAt    DateTime  @default(now())
+  expiresAt     DateTime
+  revokedAt     DateTime?
+  createdAt     DateTime  @default(now())
+  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, expiresAt])
+  @@index([expiresAt])
+}
+
+/// Channel record shown on the profile. `verificationMethod` is what the UI
+/// must render — an unverified, hand-typed channel URL is never labelled as
+/// verified ownership.
+model YoutubeConnection {
+  id                 String             @id @default(cuid())
+  userId             String             @unique
+  channelId          String
+  channelTitle       String
+  channelUrl         String
+  thumbnailUrl       String?
+  subscriberCount    Int?
+  verified           Boolean            @default(false)
+  verificationMethod VerificationMethod @default(SELF_REPORTED)
+  verifiedAt         DateTime?
+  syncedAt           DateTime?
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
+  user               User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([channelId])
+}
+
+/// Google/YouTube OAuth grant. Tokens are stored encrypted at rest (AES-256-GCM,
+/// see src/lib/crypto.ts) and are never sent to the client or written to logs.
+model YoutubeAccount {
+  id                  String    @id @default(cuid())
+  userId              String    @unique
+  googleSub           String    @unique
+  channelId           String?
+  scope               String
+  accessTokenCipher   String
+  refreshTokenCipher  String?
+  accessTokenExpires  DateTime?
+  lastRefreshedAt     DateTime?
+  revokedAt           DateTime?
+  /// Explicit lifecycle state. Without this the app could only retry blindly on
+  /// every failure; now an invalid_grant moves the connection to REAUTH_REQUIRED
+  /// once and the UI asks the user to reconnect instead of looping.
+  state               YoutubeConnectionState @default(CONNECTED)
+  /// Consecutive refresh failures. Used to stop retrying a dead grant.
+  failureCount        Int       @default(0)
+  lastErrorCode       String?
+  lastErrorAt         DateTime?
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+  user                User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([state])
+}
+
+model Video {
+  id             String      @id @default(cuid())
+  userId         String
+  youtubeVideoId String
+  youtubeUrl     String
+  title          String
+  description    String?
+  thumbnailUrl   String?
+  durationSec    Int?
+  metadataSyncedAt DateTime?
+  status         VideoStatus @default(ACTIVE)
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+  user           User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  supports       Support[]
+  campaigns      Campaign[]
+  sessions       SupportSession[]
+
+  @@unique([userId, youtubeVideoId])
+  @@index([youtubeVideoId])
+  @@index([userId, status])
+  @@index([status, createdAt(sort: Desc)])
+}
+
+/// A creator's request for support on one specific video.
+model Campaign {
+  id          String  @id @default(cuid())
+  /// Null for platform-wide/legacy campaigns not owned by a creator.
+  creatorId   String?
+  videoId     String?
+  title       String
+  description String?
+
+  startAt DateTime
+  endAt   DateTime
+  status  CampaignStatus @default(DRAFT)
+
+  /// Reward economy. Budget is decremented atomically per confirmed reward so
+  /// concurrent completions can never drive it negative.
+  rewardCredits Int @default(10)
+  rewardXp      Int @default(25)
+  budgetCredits     Int      @default(0)
+  spentCredits      Int      @default(0)
+  /// Denormalized completed-support counters used by atomic settlement and Explore.
+  completedSupports Int      @default(0)
+  dailySupports     Int      @default(0)
+  dailyCounterDay   DateTime @default(dbgenerated("CURRENT_DATE")) @db.Date
+
+  maxTotalSupports   Int?
+  maxSupportsPerUser Int?
+  dailyLimit         Int?
+  /// Minimum account age (hours) a supporter needs — cheap anti-throwaway gate.
+  minAccountAgeHours Int  @default(0)
+  /// Creator-set exposure priority, clamped server-side.
+  priority           Int  @default(0)
+  requiredWatchPercent Int @default(90)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  creator  User?            @relation("campaignCreator", fields: [creatorId], references: [id], onDelete: Cascade)
+  video    Video?           @relation(fields: [videoId], references: [id], onDelete: Cascade)
+  tasks    CampaignTask[]
+  supports Support[]
+  sessions SupportSession[]
+
+  @@index([status, startAt, endAt])
+  @@index([creatorId, status])
+  @@index([status, priority(sort: Desc), createdAt(sort: Desc)])
+}
+
+model CampaignTask {
+  id         String   @id @default(cuid())
+  campaignId String
+  type       TaskType
+  required   Boolean  @default(true)
+  /// Task-specific config, e.g. { "watchPercent": 90 } or { "minLength": 15 }.
+  config     Json?
+  rewardCredits Int   @default(0)
+  rewardXp      Int   @default(0)
+  timeoutSec    Int   @default(3600)
+  sortOrder     Int   @default(0)
+  campaign      Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  supportTasks  SupportTask[]
+
+  @@unique([campaignId, type])
+  @@index([campaignId, sortOrder])
+}
+
+/// One supporter's verified attempt at one campaign. This — not `Support` — is
+/// where the anti-abuse and verification state lives; a `Support` row is only
+/// created once a session actually completes.
+model SupportSession {
+  id          String              @id @default(cuid())
+  campaignId  String
+  supporterId String
+  creatorId   String
+  videoId     String?
+  state       SupportSessionState @default(STARTED)
+  rewardState RewardState         @default(NONE)
+
+  /// 0..100 anti-abuse risk for this specific session.
+  riskScore    Int      @default(0)
+  riskReasons  Json?
+  clientNonce  String?
+  ipHash       String?
+  userAgentHash String?
+
+  startedAt   DateTime  @default(now())
+  expiresAt   DateTime
+  completedAt DateTime?
+  failedAt    DateTime?
+  failureCode String?
+
+  supportId String? @unique
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  campaign      Campaign            @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  supporter     User                @relation("sessionSupporter", fields: [supporterId], references: [id], onDelete: Cascade)
+  creator       User                @relation("sessionCreator", fields: [creatorId], references: [id], onDelete: Cascade)
+  video         Video?              @relation(fields: [videoId], references: [id], onDelete: SetNull)
+  support       Support?            @relation(fields: [supportId], references: [id], onDelete: SetNull)
+  tasks         SupportTask[]
+  watchSession  WatchSession?
+  verifications SupportVerification[]
+  creditEntries CreditLedger[]
+  xpEntries     XpLedger[]
+  abuseSignals  AbuseSignal[]
+
+  @@index([supporterId, state])
+  @@index([campaignId, state])
+  @@index([creatorId, createdAt(sort: Desc)])
+  @@index([state, expiresAt])
+}
+
+model SupportTask {
+  id             String             @id @default(cuid())
+  sessionId      String
+  campaignTaskId String?
+  type           TaskType
+  required       Boolean            @default(true)
+  state          SupportTaskState   @default(PENDING)
+  method         VerificationMethod @default(UNVERIFIED)
+  satisfiedAt    DateTime?
+  attempts       Int                @default(0)
+  /// Non-sensitive evidence only (e.g. watched seconds, API response codes).
+  evidence       Json?
+  createdAt      DateTime           @default(now())
+  updatedAt      DateTime           @updatedAt
+
+  session      SupportSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  campaignTask CampaignTask?  @relation(fields: [campaignTaskId], references: [id], onDelete: SetNull)
+
+  @@unique([sessionId, type])
+  @@index([sessionId, state])
+}
+
+/// Server-authoritative watch tracking. The client only reports player events;
+/// the server merges them into `segments` and derives `accumulatedSec`, so a
+/// seek to 90% cannot be counted as having watched 90%.
+model WatchSession {
+  id            String    @id @default(cuid())
+  sessionId     String    @unique
+  videoId       String?
+  durationSec   Int
+  requiredSec   Int
+  accumulatedSec Int      @default(0)
+  /// Merged, non-overlapping watched ranges: [[from, to], ...] in seconds.
+  segments      Json      @default("[]")
+  playerState   String    @default("IDLE")
+  heartbeats    Int       @default(0)
+  maxRate       Float     @default(1)
+  seekCount     Int       @default(0)
+  /// Monotonic client heartbeat counter. The server rejects a sequence it has
+  /// already seen (replay) or one lower than the last accepted (out-of-order),
+  /// so a reordered network delivery cannot corrupt the watched segments.
+  lastSequence  Int       @default(0)
+  /// Position reported by the last ACCEPTED heartbeat. This is the credit cursor;
+  /// deriving it from the segment list alone lost information after a rewind.
+  lastPosition  Int       @default(0)
+  /// Count of heartbeats refused as stale/replayed — an abuse signal input.
+  rejectedBeats Int       @default(0)
+  /// Seconds the player reported as hidden/backgrounded, reported by the client
+  /// via the Page Visibility API. Advisory only: a hostile client can lie, so it
+  /// lowers trust but never by itself grants or denies a reward.
+  hiddenSec     Int       @default(0)
+  startedAt     DateTime  @default(now())
+  lastHeartbeatAt DateTime @default(now())
+  completedAt   DateTime?
+  session       SupportSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@index([lastHeartbeatAt])
+}
+
+model SupportVerification {
+  id        String             @id @default(cuid())
+  sessionId String
+  taskType  TaskType
+  method    VerificationMethod
+  result    VerificationResult
+  /// Provider status codes / observed counters. No tokens, no PII.
+  detail    Json?
+  createdAt DateTime           @default(now())
+  session   SupportSession     @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@index([sessionId, taskType])
+}
+
+/// Append-only credit accounting. `idempotencyKey` makes every award/reversal
+/// safe to retry: a duplicate write hits the unique constraint instead of
+/// paying twice.
+model CreditLedger {
+  id             String          @id @default(cuid())
+  userId         String
+  type           CreditEntryType
+  amount         Int
+  balanceAfter   Int
+  sessionId      String?
+  campaignId     String?
+  supportId      String?
+  reversalOfId   String?         @unique
+  idempotencyKey String          @unique
+  reason         String?
+  metadata       Json?
+  createdAt      DateTime        @default(now())
+
+  user       User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  session    SupportSession? @relation(fields: [sessionId], references: [id], onDelete: SetNull)
+  reversalOf CreditLedger?   @relation("creditReversal", fields: [reversalOfId], references: [id])
+  reversedBy CreditLedger?   @relation("creditReversal")
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([userId, type, createdAt])
+  @@index([createdAt])
+}
+
+model XpLedger {
+  id             String      @id @default(cuid())
+  userId         String
+  type           XpEntryType
+  amount         Int
+  balanceAfter   Int
+  sessionId      String?
+  supportId      String?
+  reversalOfId   String?     @unique
+  idempotencyKey String      @unique
+  reason         String?
+  metadata       Json?
+  createdAt      DateTime    @default(now())
+
+  user       User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  session    SupportSession? @relation(fields: [sessionId], references: [id], onDelete: SetNull)
+  reversalOf XpLedger?       @relation("xpReversal", fields: [reversalOfId], references: [id])
+  reversedBy XpLedger?       @relation("xpReversal")
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([createdAt])
+}
+
+model ReputationEvent {
+  id             String              @id @default(cuid())
+  userId         String
+  type           ReputationEventType
+  delta          Int
+  valueAfter     Int
+  sessionId      String?
+  idempotencyKey String              @unique
+  reason         String?
+  metadata       Json?
+  createdAt      DateTime            @default(now())
+  user           User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt(sort: Desc)])
+}
+
+model AbuseSignal {
+  id        String          @id @default(cuid())
+  userId    String
+  sessionId String?
+  type      AbuseSignalType
+  /// 1 (weak hint) .. 10 (near-certain abuse).
+  severity  Int             @default(1)
+  metadata  Json?
+  reviewedAt DateTime?
+  createdAt DateTime        @default(now())
+  user      User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  session   SupportSession? @relation(fields: [sessionId], references: [id], onDelete: SetNull)
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([type, createdAt])
+}
+
+/// Per-pair counters backing diminishing returns and reciprocal-loop detection
+/// (A→B→A→B farming).
+model SupportPair {
+  supporterId    String
+  receiverId     String
+  supportCount   Int      @default(0)
+  reciprocalCount Int     @default(0)
+  lastSupportAt  DateTime @default(now())
+  createdAt      DateTime @default(now())
+  supporter      User     @relation("pairSupporter", fields: [supporterId], references: [id], onDelete: Cascade)
+  receiver       User     @relation("pairReceiver", fields: [receiverId], references: [id], onDelete: Cascade)
+
+  @@id([supporterId, receiverId])
+  @@index([receiverId])
+  @@index([lastSupportAt])
+}
+
+/// Completed support. Kept as the historical/reporting record; the reward math
+/// lives in the ledgers, the verification detail in SupportSession.
+model Support {
+  id          String        @id @default(cuid())
+  supporterId String
+  receiverId  String
+  campaignId  String
+  videoId     String?
+  status      SupportStatus @default(ACTIVE)
+  /// Copy of the reward actually paid, so history stays readable even if the
+  /// campaign's reward config changes later.
+  creditsAwarded Int        @default(0)
+  xpAwarded      Int        @default(0)
+  mutual         Boolean    @default(false)
+  reversedAt     DateTime?
+  reversedById   String?
+  reversalReason String?
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  supporter User            @relation("supportsGiven", fields: [supporterId], references: [id], onDelete: Cascade)
+  receiver  User            @relation("supportsReceived", fields: [receiverId], references: [id], onDelete: Cascade)
+  campaign  Campaign        @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  video     Video?          @relation(fields: [videoId], references: [id], onDelete: SetNull)
+  session   SupportSession?
+
+  @@unique([supporterId, receiverId, campaignId])
+  @@index([receiverId, status, createdAt(sort: Desc)])
+  @@index([supporterId, status, createdAt(sort: Desc)])
+  @@index([campaignId, status])
+  @@index([status, createdAt])
+}
+
+/// Precomputed leaderboard rows so period ranking is a real ledger-derived
+/// figure instead of an activity proxy, and reads stay cheap.
+model LeaderboardSnapshot {
+  id          String            @id @default(cuid())
+  period      LeaderboardPeriod
+  mode        LeaderboardMode
+  periodStart DateTime
+  userId      String
+  rank        Int
+  score       Int
+  credits     Int               @default(0)
+  xp          Int               @default(0)
+  supports    Int               @default(0)
+  reputation  Int               @default(0)
+  computedAt  DateTime          @default(now())
+  user        User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([period, mode, periodStart, userId])
+  @@index([period, mode, periodStart, rank])
+}
+
+model Notification {
+  id             String           @id @default(cuid())
+  userId         String
+  actorId        String?
+  type           NotificationType
+  title          String
+  message        String
+  metadata       Json?
+  read           Boolean          @default(false)
+  deliveryStatus DeliveryStatus   @default(PENDING)
+  /// Set for notifications that must never be duplicated (badge awards,
+  /// reward confirmations); NULL for ordinary ones.
+  dedupeKey      String?          @unique
+  createdAt      DateTime         @default(now())
+  user           User             @relation("userNotifications", fields: [userId], references: [id], onDelete: Cascade)
+  actor          User?            @relation("actorNotifications", fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([userId, read, createdAt(sort: Desc)])
+  @@index([userId, createdAt(sort: Desc)])
+}
+
+model PushSubscription {
+  id        String   @id @default(cuid())
+  userId    String
+  endpoint  String   @unique
+  p256dh    String
+  auth      String
+  userAgent String?
+  failureCount Int   @default(0)
+  lastSuccessAt DateTime?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model Badge {
+  id           String      @id @default(cuid())
+  code         String      @unique
+  name         String
+  description  String
+  icon         String
+  requirements Json
+  rewardCredits Int        @default(0)
+  rewardXp      Int        @default(0)
+  createdAt    DateTime    @default(now())
+  users        UserBadge[]
+}
+
+model UserBadge {
+  userId   String
+  badgeId  String
+  earnedAt DateTime @default(now())
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  badge    Badge    @relation(fields: [badgeId], references: [id], onDelete: Cascade)
+
+  @@id([userId, badgeId])
+  @@index([userId, earnedAt])
+}
+
+model Activity {
+  id        String       @id @default(cuid())
+  userId    String
+  actorId   String?
+  type      ActivityType
+  targetId  String?
+  metadata  Json?
+  createdAt DateTime     @default(now())
+  user      User         @relation("userActivities", fields: [userId], references: [id], onDelete: Cascade)
+  actor     User?        @relation("actorActivities", fields: [actorId], references: [id], onDelete: SetNull)
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([userId, type, createdAt])
+}
+
+model Referral {
+  id         String    @id @default(cuid())
+  referrerId String
+  referredId String    @unique
+  code       String
+  ipHash     String?
+  /// Set once the bonus has actually been paid (on the referred user's first
+  /// verified support, not at signup). Idempotency guard for the payout.
+  creditedAt DateTime?
+  createdAt  DateTime  @default(now())
+  referrer   User      @relation("referrer", fields: [referrerId], references: [id], onDelete: Cascade)
+  referred   User      @relation("referred", fields: [referredId], references: [id], onDelete: Cascade)
+
+  @@index([code])
+  @@index([referrerId])
+}
+
+model Report {
+  id           String           @id @default(cuid())
+  reporterId   String
+  targetType   ReportTargetType
+  targetId     String
+  reason       String
+  description  String?
+  status       ReportStatus     @default(OPEN)
+  severity     Int              @default(1)
+  resolutionNote String?
+  resolvedAt   DateTime?
+  resolvedById String?
+  createdAt    DateTime         @default(now())
+  updatedAt    DateTime         @updatedAt
+  reporter     User             @relation("reportsMade", fields: [reporterId], references: [id], onDelete: Cascade)
+  resolvedBy   User?            @relation("reportsResolved", fields: [resolvedById], references: [id], onDelete: SetNull)
+
+  @@index([status, createdAt(sort: Desc)])
+  @@index([targetType, targetId])
+  @@unique([reporterId, targetType, targetId, status])
+}
+
+model AuditLog {
+  id        String      @id @default(cuid())
+  userId    String?
+  action    AuditAction
+  entity    String?
+  entityId  String?
+  /// Hashed, never the raw IP.
+  ipHash    String?
+  userAgent String?
+  metadata  Json?
+  createdAt DateTime    @default(now())
+  user      User?       @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([createdAt(sort: Desc)])
+  @@index([userId, createdAt])
+  @@index([entity, entityId])
+}
+
+model RateLimit {
+  key       String   @id
+  count     Int
+  expiresAt DateTime
+  updatedAt DateTime @updatedAt
+
+  @@index([expiresAt])
+}

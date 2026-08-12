@@ -1,0 +1,39 @@
+# Dependencies
+node_modules/
+
+# Build output
+.next/
+out/
+build/
+dist/
+
+# TypeScript incremental cache — machine-specific, must never be committed
+*.tsbuildinfo
+
+# Environment: secrets. Only .env.example belongs in version control.
+.env
+.env.*
+!.env.example
+
+# Test artifacts
+coverage/
+playwright-report/
+test-results/
+blob-report/
+.playwright/
+
+# Netlify / Vercel
+.netlify/
+.vercel/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-error.log*
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json

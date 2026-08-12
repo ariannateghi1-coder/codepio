@@ -1,0 +1,56 @@
+{
+  "name": "academy-support",
+  "version": "1.0.0",
+  "private": true,
+  "engines": {
+    "node": ">=20.9.0"
+  },
+  "scripts": {
+    "dev": "next dev",
+    "build": "prisma generate && next build",
+    "start": "next start",
+    "lint": "eslint .",
+    "test": "vitest run src/tests",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "verify": "npm run typecheck && npm run lint && npm test",
+    "e2e": "playwright test",
+    "prisma:generate": "prisma generate",
+    "prisma:migrate": "prisma migrate dev",
+    "prisma:deploy": "prisma migrate deploy",
+    "prisma:seed": "tsx prisma/seed.ts"
+  },
+  "dependencies": {
+    "@netlify/plugin-nextjs": "^5.8.1",
+    "@prisma/client": "^6.13.0",
+    "ably": "^2.11.0",
+    "argon2": "^0.43.1",
+    "clsx": "^2.1.1",
+    "lucide-react": "^0.468.0",
+    "next": "^15.4.6",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1",
+    "server-only": "^0.0.1",
+    "tailwind-merge": "^2.6.0",
+    "web-push": "^3.6.7",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.54.2",
+    "@testing-library/jest-dom": "^6.6.3",
+    "@testing-library/react": "^16.3.0",
+    "@types/node": "^22.13.14",
+    "@types/react": "^19.1.9",
+    "@types/react-dom": "^19.1.7",
+    "@types/web-push": "^3.6.4",
+    "autoprefixer": "^10.4.20",
+    "eslint": "^9.32.0",
+    "eslint-config-next": "^15.4.6",
+    "postcss": "^8.4.49",
+    "prisma": "^6.13.0",
+    "tailwindcss": "^3.4.17",
+    "tsx": "^4.20.3",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  }
+}
