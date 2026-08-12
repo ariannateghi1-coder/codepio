@@ -1286,6 +1286,232 @@ async function creditReferralIfEligible(tx: Tx, referredUserId: string, sessionI
  *   Budget       returned to the campaign, so a reversed reward does not
  *                permanently consume the creator's budget.
  */
+/**
+ * Resolves a reward held at PENDING_REVIEW.
+ *
+ * This is the missing half of the anti-abuse design. Settlement holds a risky
+ * reward instead of paying or denying it silently, but until now nothing could
+ * resolve the hold: the credits had already left the campaign budget (settlement
+ * increments `spentCredits` before deciding whether to pay) and never reached
+ * the supporter, so every held support permanently destroyed its own transfer
+ * amount. Both branches below exist to restore conservation.
+ *
+ * APPROVE pays what settlement computed and recorded on the `Support` row. It
+ * mints nothing: `spentCredits` was already charged for exactly this amount, so
+ * this is the delayed receiving half of a transfer whose paying half happened at
+ * settlement. The credit key is deliberately the SAME key settlement would have
+ * used, which is what makes an approval unable to double-pay.
+ *
+ * REFUSE returns the amount to the campaign budget instead, so the creator is
+ * not charged for a support that was never paid out.
+ *
+ * Idempotent on both paths: the reward transition guard rejects a second call
+ * (PENDING_REVIEW is the only legal source state), and every ledger write is
+ * keyed.
+ */
+export async function resolveHeldReward(input: {
+  sessionId: string;
+  moderatorId: string;
+  decision: "APPROVE" | "REFUSE";
+  reason?: string;
+}) {
+  const reason = input.reason?.slice(0, 500) ?? "";
+
+  const result = await prisma.$transaction(async (tx) => {
+    const session = await tx.supportSession.findUnique({
+      where: { id: input.sessionId },
+      select: {
+        id: true,
+        rewardState: true,
+        supporterId: true,
+        creatorId: true,
+        campaignId: true,
+        riskScore: true,
+        supportId: true,
+        supporter: { select: { level: true, reputation: true } },
+      },
+    });
+    if (!session) throw new NotFoundError("این نشست حمایت پیدا نشد.");
+    if (session.rewardState !== "PENDING_REVIEW") {
+      throw new ConflictError("این پاداش در انتظار بررسی نیست.");
+    }
+    if (!session.supportId) {
+      // A held session always has one; without it there is no recorded amount to
+      // pay and no way to know what to return, so refuse to guess.
+      throw new BusinessRuleError("این نشست هنوز تسویه نشده است.", { rule: "reward-not-settled" });
+    }
+
+    const support = await tx.support.findUnique({
+      where: { id: session.supportId },
+      select: { id: true, creditsAwarded: true, xpAwarded: true, campaignId: true, status: true },
+    });
+    if (!support) throw new NotFoundError("رکورد این حمایت پیدا نشد.");
+
+    const target = input.decision === "APPROVE" ? "CONFIRMED" : "DENIED";
+    assertRewardTransition(session.rewardState, target);
+
+    let creditsPaid = 0;
+    let xpPaid = 0;
+    let levelAfter = session.supporter.level;
+    let reputationAfter = session.supporter.reputation;
+
+    if (input.decision === "APPROVE") {
+      // Same idempotency key settlement uses for the transfer leg. If settlement
+      // had paid it, this is a no-op returning applied:false rather than a second
+      // payment.
+      const credit = await recordCredit(tx, {
+        userId: session.supporterId,
+        type: "SUPPORT_COMPLETED",
+        amount: support.creditsAwarded,
+        idempotencyKey: ledgerKey(["support-credits", session.id]),
+        sessionId: session.id,
+        campaignId: support.campaignId,
+        supportId: support.id,
+        reason: "held support approved by moderator",
+        metadata: { moderatorId: input.moderatorId, riskScore: session.riskScore },
+      });
+      if (credit.applied) creditsPaid = support.creditsAwarded;
+
+      // The whole XP amount in one entry, from Support.xpAwarded — the permanent
+      // copy of what settlement computed. Reconstructing the per-component
+      // entries would re-derive amounts from config that may have changed since,
+      // and the reversal path reverses by session anyway.
+      const xp = await recordXp(tx, {
+        userId: session.supporterId,
+        type: "SUPPORT_COMPLETED",
+        amount: support.xpAwarded,
+        idempotencyKey: ledgerKey(["review-xp", session.id]),
+        sessionId: session.id,
+        supportId: support.id,
+      });
+      if (xp.applied) {
+        xpPaid = support.xpAwarded;
+        levelAfter = xp.level;
+      }
+
+      // Creator side: XP only, never credits — same rule as settlement.
+      await recordXp(tx, {
+        userId: session.creatorId,
+        type: "SUPPORT_RECEIVED",
+        amount: REWARDS.SUPPORT_RECEIVED.xp,
+        idempotencyKey: ledgerKey(["received-xp", session.id]),
+        sessionId: session.id,
+        supportId: support.id,
+      });
+
+      // Settlement recorded a zero-delta reputation entry under its own key, so a
+      // distinct key is required here to award the real value.
+      const rep = await recordReputation(tx, {
+        userId: session.supporterId,
+        type: "SUPPORT_VERIFIED",
+        delta: REPUTATION.SUPPORT_VERIFIED,
+        idempotencyKey: ledgerKey(["review-reputation", session.id]),
+        sessionId: session.id,
+      });
+      reputationAfter = rep.valueAfter;
+    } else {
+      // Return the transfer to the budget: the creator must not pay for a support
+      // that was never credited. Clamped so no adjustment can drive it negative.
+      if (support.creditsAwarded > 0) {
+        await tx.$executeRaw`
+          UPDATE "Campaign"
+          SET "spentCredits" = GREATEST(0, "spentCredits" - ${support.creditsAwarded})
+          WHERE "id" = ${support.campaignId};
+        `;
+      }
+
+      // Nothing was ever paid, so there is no ledger entry to reverse. The row is
+      // kept and marked instead of deleted, so the decision stays auditable.
+      if (support.status !== "REVERSED") {
+        await tx.support.update({
+          where: { id: support.id },
+          data: {
+            status: "REVERSED",
+            reversedAt: new Date(),
+            reversedById: input.moderatorId,
+            reversalReason: reason || "پاداش پس از بررسی تأیید نشد.",
+          },
+        });
+        await tx.user.update({
+          where: { id: session.supporterId },
+          data: { supportsCompleted: { decrement: 1 } },
+        });
+      }
+
+      const rep = await recordReputation(tx, {
+        userId: session.supporterId,
+        type: "SUPPORT_REVERSED",
+        delta: REPUTATION.SUPPORT_REVERSED,
+        idempotencyKey: ledgerKey(["review-refusal-reputation", session.id]),
+        sessionId: session.id,
+        reason: reason.slice(0, 200),
+      });
+      reputationAfter = rep.valueAfter;
+    }
+
+    await tx.supportSession.update({
+      where: { id: session.id },
+      data: { rewardState: target },
+    });
+
+    if (input.decision === "APPROVE") {
+      await evaluateBadges(tx, session.supporterId);
+      await evaluateBadges(tx, session.creatorId);
+    }
+
+    const notification = await createNotificationTx(tx, {
+      userId: session.supporterId,
+      type: input.decision === "APPROVE" ? "SUPPORT_VERIFIED" : "SUPPORT_REVERSED",
+      title: input.decision === "APPROVE" ? "پاداش حمایت شما تأیید شد 🎉" : "پاداش حمایت شما تأیید نشد",
+      message:
+        input.decision === "APPROVE"
+          ? `بررسی انجام شد و ${creditsPaid} اعتبار به حساب شما اضافه شد.`
+          : `دلیل: ${reason || "این حمایت در بررسی دستی تأیید نشد."}`,
+      metadata: { sessionId: session.id, supportId: support.id },
+      dedupeKey: ledgerKey(["review-notification", session.id, target]),
+    });
+
+    await writeAuditTx(tx, {
+      userId: input.moderatorId,
+      action: "SUPPORT_REVERSAL",
+      entity: "SupportSession",
+      entityId: session.id,
+      metadata: {
+        decision: input.decision,
+        rewardState: target,
+        supportId: support.id,
+        riskScore: session.riskScore,
+        credits: creditsPaid,
+        xp: xpPaid,
+        reason: reason.slice(0, 200),
+      },
+    });
+
+    return {
+      payload: {
+        sessionId: session.id,
+        supportId: support.id,
+        rewardState: target as "CONFIRMED" | "DENIED",
+        credits: creditsPaid,
+        xp: xpPaid,
+        level: { before: session.supporter.level, after: levelAfter },
+        reputation: { before: session.supporter.reputation, after: reputationAfter },
+      },
+      notification,
+    };
+  });
+
+  if (result.notification) await deliverNotification(result.notification);
+
+  logger.info("resolved held support reward", {
+    sessionId: input.sessionId,
+    decision: input.decision,
+    credits: result.payload.credits,
+  });
+
+  return result.payload;
+}
+
 export async function reverseSupport(input: {
   supportId: string;
   moderatorId: string;

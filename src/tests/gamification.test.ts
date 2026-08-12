@@ -14,6 +14,7 @@ import {
   nextLevelProgress,
   pairRewardMultiplier,
   rankTierLabel,
+  RISK_THRESHOLDS,
 } from "@/lib/gamification";
 import { badgesToAward, type UserMetrics } from "@/lib/services/badges";
 import { nextStreak } from "@/lib/services/streak";
@@ -412,7 +413,46 @@ describe("anti-abuse — graph signals", () => {
 
 describe("risk decision thresholds", () => {
   it("maps a mid-range score to review rather than denial", () => {
+    // Severity 7 -> 56. This used to be severity 6 (48), which stopped being a
+    // review once the review threshold moved from 40 to 50; the property being
+    // tested is "mid-range means review, not deny", so the input moves with the
+    // threshold rather than the expectation.
+    const reasons = [{ type: "PAIR_FARMING" as const, severity: 7, note: "test" }];
+    const assessment = scoreFromReasons(reasons);
+    expect(assessment.score).toBeGreaterThanOrEqual(RISK_THRESHOLDS.review);
+    expect(assessment.score).toBeLessThan(RISK_THRESHOLDS.deny);
+    expect(assessment.decision).toBe("REVIEW");
+  });
+
+  it("allows a score below the review threshold", () => {
     const reasons = [{ type: "PAIR_FARMING" as const, severity: 6, note: "test" }];
-    expect(scoreFromReasons(reasons).decision).toBe("REVIEW");
+    expect(scoreFromReasons(reasons).decision).toBe("ALLOW");
+  });
+});
+
+describe("RISK_THRESHOLDS", () => {
+  /**
+   * The specific combination that motivated moving `review` from 40 to 50: a
+   * brand-new account supporting from an address it shares with the creator, which
+   * is what a household, an office or carrier NAT looks like. Pinned as a value
+   * test so a future weight change cannot silently put ordinary first supports
+   * back into the moderation queue.
+   */
+  const SEVERITY_WEIGHT = 8;
+
+  it("pays an ordinary first support from a shared address instantly", () => {
+    const score = (3 + 2) * SEVERITY_WEIGHT; // ACCOUNT_TOO_NEW + DUPLICATE_DEVICE
+    expect(score).toBe(40);
+    expect(score).toBeLessThan(RISK_THRESHOLDS.review);
+  });
+
+  it("still holds when a third signal is present", () => {
+    const score = (3 + 2 + 4) * SEVERITY_WEIGHT; // + PAIR_FARMING
+    expect(score).toBeGreaterThanOrEqual(RISK_THRESHOLDS.review);
+    expect(score).toBeLessThan(RISK_THRESHOLDS.deny);
+  });
+
+  it("keeps review strictly below deny", () => {
+    expect(RISK_THRESHOLDS.review).toBeLessThan(RISK_THRESHOLDS.deny);
   });
 });

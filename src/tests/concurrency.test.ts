@@ -3,6 +3,7 @@ import { PrismaClient } from "@prisma/client";
 import {
   completeSupportSession,
   openWatchTarget,
+  resolveHeldReward,
   startSupportSession,
   watchTimerStatus,
 } from "@/lib/services/support";
@@ -463,4 +464,189 @@ describe.skipIf(!enabled)("support completion under concurrency", () => {
     },
     60_000
   );
+});
+
+/**
+ * Held-reward resolution, against a real database.
+ *
+ * The property under test is conservation across the hold. Settlement charges the
+ * campaign budget BEFORE deciding whether to pay, so a session parked at
+ * PENDING_REVIEW has credits that have left the creator's budget and not arrived
+ * anywhere. Approving must deliver exactly that amount and refusing must return
+ * exactly that amount — anything else destroys or mints currency, which is the
+ * bug this path was added to close.
+ *
+ * The fixture forces the hold by writing `rewardState` directly rather than by
+ * engineering a risky session: the risk score depends on account age and shared
+ * addresses, which a test cannot control precisely, and what is under test here
+ * is the resolution, not the detection.
+ */
+describe.runIf(enabled)("held reward resolution", () => {
+  async function seedHeldSupport(tag: string) {
+    const db = prisma!;
+    const creator = await db.user.create({
+      data: {
+        email: `hr-c-${tag}@test.local`,
+        username: `hrc${tag}`,
+        name: "Hold Creator",
+        passwordHash: await hashPassword("Passw0rd!x"),
+        referralCode: referralCode(`hr${tag}`),
+        status: "ACTIVE",
+        credits: 0,
+      },
+    });
+    const supporter = await db.user.create({
+      data: {
+        email: `hr-s-${tag}@test.local`,
+        username: `hrs${tag}`,
+        name: "Hold Supporter",
+        passwordHash: await hashPassword("Passw0rd!x"),
+        referralCode: referralCode(`hr${tag}`),
+        status: "ACTIVE",
+        credits: 0,
+      },
+    });
+    const video = await db.video.create({
+      data: {
+        userId: creator.id,
+        youtubeVideoId: `hv${tag}`.slice(0, 20),
+        youtubeUrl: `https://www.youtube.com/watch?v=hv${tag}`,
+        title: "Held video",
+        durationSec: DURATION_SEC,
+        metadataSyncedAt: new Date(),
+        status: "ACTIVE",
+      },
+    });
+    // Budget already charged for one transfer: this is the state settlement leaves
+    // behind when it holds a reward.
+    const campaign = await db.campaign.create({
+      data: {
+        creatorId: creator.id,
+        videoId: video.id,
+        title: `Held campaign ${tag}`,
+        budgetCredits: SUPPORT_TRANSFER_CREDITS * 2,
+        spentCredits: SUPPORT_TRANSFER_CREDITS,
+        rewardCredits: SUPPORT_TRANSFER_CREDITS,
+        status: "ACTIVE",
+        startAt: new Date(Date.now() - 60_000),
+        endAt: new Date(Date.now() + 86_400_000),
+      },
+    });
+    const session = await db.supportSession.create({
+      data: {
+        supporterId: supporter.id,
+        creatorId: creator.id,
+        campaignId: campaign.id,
+        videoId: video.id,
+        state: "COMPLETED",
+        rewardState: "PENDING_REVIEW",
+        riskScore: 56,
+        completedAt: new Date(),
+        expiresAt: new Date(Date.now() + 3_600_000),
+      },
+    });
+    const support = await db.support.create({
+      data: {
+        supporterId: supporter.id,
+        receiverId: creator.id,
+        campaignId: campaign.id,
+        videoId: video.id,
+        creditsAwarded: SUPPORT_TRANSFER_CREDITS,
+        xpAwarded: 25,
+        riskScore: 56,
+        watchedSec: REQUIRED_SEC,
+        requiredWatchSec: REQUIRED_SEC,
+      },
+    });
+    await db.supportSession.update({ where: { id: session.id }, data: { supportId: support.id } });
+    return { creator, supporter, campaign, session, support };
+  }
+
+  it("approving pays exactly the held transfer, once", async () => {
+    const db = prisma!;
+    const fx = await seedHeldSupport(`a${Date.now().toString(36)}`);
+
+    const before = await db.user.findUniqueOrThrow({ where: { id: fx.supporter.id } });
+    expect(before.credits).toBe(0);
+
+    const result = await resolveHeldReward({
+      sessionId: fx.session.id,
+      moderatorId: fx.creator.id,
+      decision: "APPROVE",
+    });
+    expect(result.credits).toBe(SUPPORT_TRANSFER_CREDITS);
+    expect(result.rewardState).toBe("CONFIRMED");
+
+    const after = await db.user.findUniqueOrThrow({ where: { id: fx.supporter.id } });
+    expect(after.credits).toBe(SUPPORT_TRANSFER_CREDITS);
+    expect(after.points).toBe(fx.support.xpAwarded);
+
+    // The budget is NOT charged a second time: it was already charged at settlement.
+    const campaign = await db.campaign.findUniqueOrThrow({ where: { id: fx.campaign.id } });
+    expect(campaign.spentCredits).toBe(SUPPORT_TRANSFER_CREDITS);
+
+    // Conservation: what left the budget equals what arrived in the wallet.
+    expect(campaign.spentCredits).toBe(after.credits);
+
+    const audit = await auditUserBalances(db, fx.supporter.id);
+    expect(audit.credits.drift).toBe(0);
+    expect(audit.xp.drift).toBe(0);
+    expect(audit.consistent).toBe(true);
+
+    // A second approval is refused rather than paying twice.
+    await expect(
+      resolveHeldReward({ sessionId: fx.session.id, moderatorId: fx.creator.id, decision: "APPROVE" })
+    ).rejects.toThrow();
+    const final = await db.user.findUniqueOrThrow({ where: { id: fx.supporter.id } });
+    expect(final.credits).toBe(SUPPORT_TRANSFER_CREDITS);
+  });
+
+  it("refusing returns the held transfer to the campaign budget", async () => {
+    const db = prisma!;
+    const fx = await seedHeldSupport(`r${Date.now().toString(36)}`);
+
+    const result = await resolveHeldReward({
+      sessionId: fx.session.id,
+      moderatorId: fx.creator.id,
+      decision: "REFUSE",
+      reason: "manual check failed",
+    });
+    expect(result.credits).toBe(0);
+    expect(result.rewardState).toBe("DENIED");
+
+    const supporter = await db.user.findUniqueOrThrow({ where: { id: fx.supporter.id } });
+    expect(supporter.credits).toBe(0);
+    expect(supporter.points).toBe(0);
+
+    const campaign = await db.campaign.findUniqueOrThrow({ where: { id: fx.campaign.id } });
+    expect(campaign.spentCredits).toBe(0);
+
+    const support = await db.support.findUniqueOrThrow({ where: { id: fx.support.id } });
+    expect(support.status).toBe("REVERSED");
+
+    const audit = await auditUserBalances(db, fx.supporter.id);
+    expect(audit.credits.drift).toBe(0);
+    expect(audit.xp.drift).toBe(0);
+    expect(audit.consistent).toBe(true);
+
+    // DENIED is terminal: it cannot later be approved into a payment.
+    await expect(
+      resolveHeldReward({ sessionId: fx.session.id, moderatorId: fx.creator.id, decision: "APPROVE" })
+    ).rejects.toThrow();
+    const finalCampaign = await db.campaign.findUniqueOrThrow({ where: { id: fx.campaign.id } });
+    expect(finalCampaign.spentCredits).toBe(0);
+    const finalUser = await db.user.findUniqueOrThrow({ where: { id: fx.supporter.id } });
+    expect(finalUser.credits).toBe(0);
+  });
+
+  it("refuses a session that is not held", async () => {
+    const fx = await seedHeldSupport(`n${Date.now().toString(36)}`);
+    await prisma!.supportSession.update({
+      where: { id: fx.session.id },
+      data: { rewardState: "CONFIRMED" },
+    });
+    await expect(
+      resolveHeldReward({ sessionId: fx.session.id, moderatorId: fx.creator.id, decision: "APPROVE" })
+    ).rejects.toThrow();
+  });
 });

@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { RotateCcw } from "lucide-react";
+import { Check, X } from "lucide-react";
 import { api, errorMessage } from "@/lib/client-api";
 import { Card } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
@@ -22,6 +22,11 @@ import { formatDuration, formatNumber, formatRelativeTime } from "@/lib/cn";
  *
  * Reversal goes through the service, which reverses every ledger entry, adjusts
  * reputation and returns the campaign budget — not a bare status flip.
+ *
+ * A queued row offers approve and refuse, because until both existed the queue
+ * was a dead end: settlement had already charged the campaign budget, so a held
+ * reward that was never resolved destroyed its own transfer amount. Approve pays
+ * it, refuse returns it to the budget.
  */
 
 type PendingRow = {
@@ -69,6 +74,8 @@ export function AdminSupportsTable({ initialFilter = "PENDING_REVIEW" }: { initi
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [reverseTarget, setReverseTarget] = useState<string | null>(null);
+  const [refuseTarget, setRefuseTarget] = useState<string | null>(null);
+  const [approving, setApproving] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -90,6 +97,25 @@ export function AdminSupportsTable({ initialFilter = "PENDING_REVIEW" }: { initi
       setLoading(false);
     }
   }, [filter]);
+
+  const approve = useCallback(
+    async (sessionId: string) => {
+      setApproving(sessionId);
+      try {
+        const res = await api.patch<{ message: string }>("/api/v1/admin/supports", {
+          sessionId,
+          decision: "APPROVE",
+        });
+        toast.push({ tone: "success", message: res.message });
+        await load();
+      } catch (e) {
+        toast.push({ tone: "error", message: errorMessage(e) });
+      } finally {
+        setApproving(null);
+      }
+    },
+    [load, toast]
+  );
 
   useEffect(() => {
     void load();
@@ -161,19 +187,25 @@ export function AdminSupportsTable({ initialFilter = "PENDING_REVIEW" }: { initi
                     </ul>
                   )}
 
-                  <div className="mt-3 flex items-center gap-2">
+                  <div className="mt-3 flex flex-wrap items-center gap-2">
                     <span className="text-xs text-fg-subtle">{formatRelativeTime(row.createdAt)}</span>
-                    {row.supportId && (
-                      <Button
-                        variant="danger"
-                        size="sm"
-                        className="ms-auto"
-                        onClick={() => setReverseTarget(row.supportId)}
-                        icon={<RotateCcw aria-hidden size={14} />}
-                      >
-                        برگشت حمایت
-                      </Button>
-                    )}
+                    <Button
+                      size="sm"
+                      className="ms-auto"
+                      loading={approving === row.id}
+                      onClick={() => void approve(row.id)}
+                      icon={<Check aria-hidden size={14} />}
+                    >
+                      تأیید و پرداخت
+                    </Button>
+                    <Button
+                      variant="danger"
+                      size="sm"
+                      onClick={() => setRefuseTarget(row.id)}
+                      icon={<X aria-hidden size={14} />}
+                    >
+                      رد پاداش
+                    </Button>
                   </div>
                 </Card>
               </li>
@@ -229,6 +261,16 @@ export function AdminSupportsTable({ initialFilter = "PENDING_REVIEW" }: { initi
           ))}
         </ul>
       )}
+
+      <RefuseModal
+        sessionId={refuseTarget}
+        open={refuseTarget !== null}
+        onClose={() => setRefuseTarget(null)}
+        onDone={async (message) => {
+          toast.push({ tone: "success", message });
+          await load();
+        }}
+      />
 
       <ReverseModal
         supportId={reverseTarget}
@@ -295,6 +337,65 @@ function ReverseModal({
         </Field>
         <Button type="submit" variant="danger" loading={loading} fullWidth>
           تأیید برگشت
+        </Button>
+      </form>
+    </Modal>
+  );
+}
+
+function RefuseModal({
+  sessionId,
+  open,
+  onClose,
+  onDone,
+}: {
+  sessionId: string | null;
+  open: boolean;
+  onClose: () => void;
+  onDone: (message: string) => Promise<void>;
+}) {
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+
+  async function submit(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!sessionId) return;
+    const form = new FormData(event.currentTarget);
+    setLoading(true);
+    setError("");
+    try {
+      const res = await api.patch<{ message: string }>("/api/v1/admin/supports", {
+        sessionId,
+        decision: "REFUSE",
+        reason: String(form.get("reason") ?? ""),
+      });
+      await onDone(res.message);
+      onClose();
+    } catch (e) {
+      setError(errorMessage(e));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title="رد پاداش"
+      description="پاداشی پرداخت نمی‌شود و اعتبار رزروشده به بودجه کمپین برمی‌گردد."
+    >
+      <form onSubmit={submit} className="space-y-4" noValidate>
+        {error && (
+          <Alert tone="danger" live="alert">
+            {error}
+          </Alert>
+        )}
+        <Field label="دلیل رد" htmlFor="refuse-reason" hint="برای کاربر نمایش داده می‌شود.">
+          <Textarea id="refuse-reason" name="reason" />
+        </Field>
+        <Button type="submit" variant="danger" loading={loading} fullWidth>
+          تأیید رد پاداش
         </Button>
       </form>
     </Modal>

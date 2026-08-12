@@ -247,6 +247,19 @@ export const supportWatchSchema = z.object({ sessionId: cuidSchema });
 
 export const supportCompleteSchema = z.object({ sessionId: cuidSchema });
 
+/**
+ * Moderator decision on a reward held at PENDING_REVIEW.
+ *
+ * `sessionId`, not `supportId`: the hold lives on the session's `rewardState`,
+ * and a held session is the only thing that can be resolved. A reason is required
+ * for a refusal because the user is shown it; an approval may omit it.
+ */
+export const supportReviewSchema = z.object({
+  sessionId: cuidSchema,
+  decision: z.enum(["APPROVE", "REFUSE"]),
+  reason: cleanText(500).optional(),
+});
+
 export const supportReverseSchema = z.object({
   supportId: cuidSchema,
   reason: cleanText(500).pipe(z.string().min(5, "دلیل برگشت باید توضیح داده شود.")),

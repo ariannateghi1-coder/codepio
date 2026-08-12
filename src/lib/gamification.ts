@@ -282,8 +282,18 @@ export const WATCH_RULES = {
 
 /** Risk thresholds mapping a session's risk score to a reward decision. */
 export const RISK_THRESHOLDS = {
-  /** At or above: hold the reward for manual review instead of paying instantly. */
-  review: 40,
+  /**
+   * At or above: hold the reward for manual review instead of paying instantly.
+   *
+   * 50, not 40. With SEVERITY_WEIGHT = 8 the previous value meant a brand-new
+   * account (ACCOUNT_TOO_NEW, severity 3) supporting from a shared household or
+   * carrier-NAT address (DUPLICATE_DEVICE, severity 2) scored exactly 40 and was
+   * held — a completely ordinary first support. At 50 that pair pays instantly
+   * while any third signal, or either of those combined with a stronger one,
+   * still lands in the queue. The signals themselves are unchanged: this moves
+   * only where the line sits, so the evidence a moderator sees stays identical.
+   */
+  review: 50,
   /** At or above: deny the reward outright. */
   deny: 75,
 } as const;
