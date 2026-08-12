@@ -11,10 +11,11 @@ import "./globals.css";
  * immediately in a fallback and never leaves a blank page; the CSS variable it
  * exposes is the same one the design tokens reference.
  *
- * The theme script runs before paint to avoid a flash of the wrong theme. Its
- * exact bytes are allow-listed by SHA-256 in next.config.ts; script-src does not
- * permit arbitrary inline JavaScript. Inline styles remain required by Next and
- * the component styling stack, so style-src documents that narrower exception.
+ * The theme script runs before paint to avoid a flash of the wrong theme. It is
+ * covered by 'unsafe-inline' in script-src, which the App Router already requires
+ * for the inline RSC bootstrap scripts it streams on every response; see the CSP
+ * note in next.config.ts for why a hash cannot be used here. Inline styles are
+ * likewise required by Next and the component styling stack.
  */
 
 const vazirmatn = Vazirmatn({
