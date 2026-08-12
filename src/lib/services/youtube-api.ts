@@ -15,7 +15,7 @@ import { parseIsoDuration, isValidYoutubeChannelId, isValidYoutubeVideoId } from
  *
  *  SUBSCRIBE  → verifiable server-side via subscriptions.list with the user's
  *               OAuth grant (youtube.readonly). Result: YOUTUBE_API.
- *  LIKE       → verifiable server-side via videos.getRating with the user's
+ *  LIKE       → verifiable server-side via the liked-videos playlist with the user's
  *               OAuth grant. Result: YOUTUBE_API.
  *  WATCH 90%  → NOT verifiable through any YouTube API. There is no endpoint
  *               that reports whether a given user watched a given fraction of a
@@ -556,17 +556,48 @@ export async function checkSubscription(userId: string, channelId: string): Prom
   }
 }
 
-/** Did `userId` like `videoId`? Uses videos.getRating on the user's own grant. */
+/**
+ * Did `userId` like `videoId`?
+ *
+ * Reads the user's own "Liked videos" playlist (`LL`) filtered to this one video:
+ * one item back means liked, zero means not. Costs 1 quota unit either way.
+ *
+ * The obvious call, `videos.getRating`, is NOT usable here. Google classifies it
+ * as a write-adjacent rating endpoint, so it demands the full `youtube` /
+ * `youtube.force-ssl` scope and answers a `youtube.readonly` grant with
+ * `403 ACCESS_TOKEN_SCOPE_INSUFFICIENT`. That failure is indistinguishable from a
+ * generic API error at the HTTP layer, which is exactly how an honest supporter
+ * who really had liked the video ended up reading "لایک تأیید نشد" forever.
+ *
+ * Asking for the wider scope was the alternative and was rejected: `youtube`
+ * grants the ability to rate, comment, subscribe and modify playlists on the
+ * user's behalf. Read-only access to a list the user already owns is the smaller
+ * ask for the same answer.
+ *
+ * Caveat worth knowing: `LL` reflects likes, so a user who has cleared or paused
+ * their like history can be liking a video that is not in the list. That returns
+ * NOT_VERIFIED, never a false VERIFIED, so the failure direction stays safe.
+ */
 export async function checkLike(userId: string, videoId: string): Promise<ApiCheck> {
   const token = await getAccessToken(userId);
   if (!token.ok) return checkFromTokenFailure(token);
 
   try {
-    type Response = { items?: { videoId: string; rating: string }[] };
-    const data = await apiGet<Response>("videos/getRating", { id: videoId }, { accessToken: token.accessToken });
-    const rating = data.items?.[0]?.rating ?? "none";
-    const satisfied = rating === "like";
-    return { outcome: satisfied ? "VERIFIED" : "NOT_VERIFIED", available: true, satisfied, detail: { rating } };
+    type Response = { items?: { contentDetails?: { videoId?: string } }[]; pageInfo?: { totalResults: number } };
+    const data = await apiGet<Response>(
+      "playlistItems",
+      { part: "contentDetails", playlistId: "LL", videoId, maxResults: "1" },
+      { accessToken: token.accessToken }
+    );
+    // The videoId filter is applied by the API, but confirm the returned item is
+    // the video we asked about rather than trusting a non-empty list.
+    const satisfied = (data.items ?? []).some((item) => item.contentDetails?.videoId === videoId);
+    return {
+      outcome: satisfied ? "VERIFIED" : "NOT_VERIFIED",
+      available: true,
+      satisfied,
+      detail: { source: "LIKED_PLAYLIST", matched: satisfied },
+    };
   } catch (e) {
     return await apiFailureToCheck(userId, e, { videoId });
   }
@@ -584,6 +615,16 @@ async function apiFailureToCheck(userId: string, error: unknown, context: Record
     await markConnectionState(userId, "REAUTH_REQUIRED", "API_401");
     logger.warn("youtube API rejected a fresh token", { userId, ...context });
     return { outcome: "REAUTH_REQUIRED", available: false, satisfied: false, detail: { reason: "UNAUTHORIZED" } };
+  }
+
+  // A grant that cannot answer this particular question is still valid for the
+  // others, so the connection is left alone — parking it would break the
+  // subscribe check too. What matters is not reporting this as "task not done":
+  // that is the shape the getRating bug took, where an honest like read as a
+  // failure and no amount of re-checking could ever clear it.
+  if (/insufficientPermissions|ACCESS_TOKEN_SCOPE_INSUFFICIENT|insufficient authentication scopes/i.test(message)) {
+    logger.warn("youtube grant lacks the scope for this check", { userId, ...context });
+    return { outcome: "REAUTH_REQUIRED", available: false, satisfied: false, detail: { reason: "SCOPE_INSUFFICIENT" } };
   }
 
   if (isTransientApiError(error)) {

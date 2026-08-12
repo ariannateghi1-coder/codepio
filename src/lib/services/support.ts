@@ -659,7 +659,7 @@ function likeNote(outcome: TaskVerification["outcome"]): string | undefined {
     case "VERIFIED":
       return undefined;
     case "NOT_VERIFIED":
-      return "لایک این ویدیو تأیید نشد. ویدیو را لایک کنید و دوباره بررسی بزنید.";
+      return "این ویدیو در فهرست «ویدیوهای پسندیده» حساب یوتیوب شما پیدا نشد. اگر همین حالا لایک کرده‌اید، چند لحظه صبر کنید و دوباره بررسی بزنید.";
     case "TEMPORARY_ERROR":
       return "یوتیوب در این لحظه پاسخ نداد. این مورد ناموفق ثبت نشد؛ چند لحظه بعد دوباره بررسی کنید.";
     case "REAUTH_REQUIRED":

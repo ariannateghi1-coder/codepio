@@ -140,3 +140,4 @@ describe("formatDuration", () => {
     expect(formatDuration(-5)).toBe("0:00");
   });
 });
+
