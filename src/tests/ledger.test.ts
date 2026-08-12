@@ -6,6 +6,8 @@ import {
   recordCredit,
   recordXp,
   reverseCredit,
+  reverseXp,
+  compensateMissingXp,
 } from "@/lib/services/ledger";
 import { SIGNUP_GRANT_CREDITS } from "@/lib/gamification";
 import type { Prisma } from "@prisma/client";
@@ -43,6 +45,15 @@ function createFakeTx() {
   const users = new Map<string, UserRow>();
   const credits: LedgerRow[] = [];
   const xp: LedgerRow[] = [];
+  /**
+   * Permanent per-day aggregates, keyed "userId|yyyy-mm-dd".
+   *
+   * recordXp() writes here in the same transaction as the XpLedger row, because
+   * XpLedger is pruned after 7 days and every window longer than that (monthly
+   * leaderboard, all-time, last-week trend) plus auditUserBalances() read this
+   * instead. The fake models it so those invariants are testable here.
+   */
+  const rollups = new Map<string, { userId: string; day: Date; xp: number; abuseSeverity: number }>();
   let sequence = 0;
 
   users.set("u1", { id: "u1", credits: 0, points: 0, level: 1, reputation: 100, rankTier: "BRONZE", supportsCompleted: 0 });
@@ -138,6 +149,41 @@ function createFakeTx() {
     },
     creditLedger: makeLedger(credits),
     xpLedger: makeLedger(xp),
+    userDailyRollup: {
+      upsert({
+        where,
+        create,
+        update,
+      }: {
+        where: { userId_day: { userId: string; day: Date } };
+        create: { userId: string; day: Date; xp?: number; abuseSeverity?: number };
+        update: { xp?: { increment: number }; abuseSeverity?: { increment: number } };
+      }) {
+        const key = `${where.userId_day.userId}|${where.userId_day.day.toISOString().slice(0, 10)}`;
+        const existing = rollups.get(key);
+        if (!existing) {
+          rollups.set(key, {
+            userId: create.userId,
+            day: create.day,
+            xp: create.xp ?? 0,
+            abuseSeverity: create.abuseSeverity ?? 0,
+          });
+        } else {
+          if (update.xp) existing.xp += update.xp.increment;
+          if (update.abuseSeverity) existing.abuseSeverity += update.abuseSeverity.increment;
+        }
+        return Promise.resolve(rollups.get(key));
+      },
+      aggregate({ where }: { where?: { userId?: string } } = {}) {
+        const rows = [...rollups.values()].filter((row) => where?.userId === undefined || row.userId === where.userId);
+        return Promise.resolve({
+          _sum: {
+            xp: rows.reduce((sum, row) => sum + row.xp, 0),
+            abuseSeverity: rows.reduce((sum, row) => sum + row.abuseSeverity, 0),
+          },
+        });
+      },
+    },
   };
 
   function pick(row: UserRow, select: Record<string, boolean>) {
@@ -146,7 +192,7 @@ function createFakeTx() {
     return out;
   }
 
-  return { tx: tx as unknown as Prisma.TransactionClient, users, credits, xp };
+  return { tx: tx as unknown as Prisma.TransactionClient, users, credits, xp, rollups };
 }
 
 describe("ledgerKey", () => {
@@ -363,5 +409,153 @@ describe("grantSignupCredits", () => {
     const audit = await auditUserBalances(fake.tx, "u1");
     expect(audit.consistent).toBe(true);
     expect(audit.credits.drift).toBe(0);
+  });
+});
+
+describe("XP rollup — what makes XpLedger retention safe", () => {
+  let fake: ReturnType<typeof createFakeTx>;
+  beforeEach(() => {
+    fake = createFakeTx();
+  });
+
+  it("writes a permanent per-day aggregate alongside every XP entry", async () => {
+    await recordXp(fake.tx, { userId: "u1", type: "SUPPORT_COMPLETED", amount: 25, idempotencyKey: "x1" });
+    const rollup = await fake.tx.userDailyRollup.aggregate({ where: { userId: "u1" } });
+    expect(rollup._sum.xp).toBe(25);
+    expect(fake.rollups.size).toBe(1);
+  });
+
+  it("accumulates several entries on the same day into one row", async () => {
+    await recordXp(fake.tx, { userId: "u1", type: "SUPPORT_COMPLETED", amount: 25, idempotencyKey: "x1" });
+    await recordXp(fake.tx, { userId: "u1", type: "MUTUAL_BONUS", amount: 10, idempotencyKey: "x2" });
+    expect(fake.rollups.size).toBe(1);
+    const rollup = await fake.tx.userDailyRollup.aggregate({ where: { userId: "u1" } });
+    expect(rollup._sum.xp).toBe(35);
+  });
+
+  it("does not double count a replayed idempotency key", async () => {
+    await recordXp(fake.tx, { userId: "u1", type: "SUPPORT_COMPLETED", amount: 25, idempotencyKey: "x1" });
+    await recordXp(fake.tx, { userId: "u1", type: "SUPPORT_COMPLETED", amount: 25, idempotencyKey: "x1" });
+    const rollup = await fake.tx.userDailyRollup.aggregate({ where: { userId: "u1" } });
+    expect(rollup._sum.xp).toBe(25);
+  });
+
+  it("decrements on reversal, so the rollup nets out like the balance", async () => {
+    const original = await recordXp(fake.tx, {
+      userId: "u1",
+      type: "SUPPORT_COMPLETED",
+      amount: 40,
+      idempotencyKey: "x1",
+    });
+    await reverseXp(fake.tx, original.entryId!, "support reversed");
+
+    expect(fake.users.get("u1")!.points).toBe(0);
+    const rollup = await fake.tx.userDailyRollup.aggregate({ where: { userId: "u1" } });
+    expect(rollup._sum.xp).toBe(0);
+  });
+
+  it("keeps the rollup equal to User.points, which is what the audit compares", async () => {
+    await recordXp(fake.tx, { userId: "u1", type: "SUPPORT_COMPLETED", amount: 120, idempotencyKey: "a" });
+    await recordXp(fake.tx, { userId: "u1", type: "STREAK", amount: 30, idempotencyKey: "b" });
+
+    const audit = await auditUserBalances(fake.tx, "u1");
+    expect(audit.xp.cached).toBe(150);
+    // Sourced from the rollup, not XpLedger: pruning the detail table must not make
+    // the platform look like it has XP drift.
+    expect(audit.xp.ledger).toBe(150);
+    expect(audit.xp.drift).toBe(0);
+  });
+});
+
+describe("compensateMissingXp — reversal after XpLedger retention", () => {
+  let fake: ReturnType<typeof createFakeTx>;
+  beforeEach(() => {
+    fake = createFakeTx();
+  });
+
+  it("claws back the full award when no detail entries survive", async () => {
+    // Simulates a support older than the 7-day window: points are on the balance,
+    // but the XpLedger rows that produced them have been pruned.
+    await recordXp(fake.tx, { userId: "u1", type: "SUPPORT_COMPLETED", amount: 60, idempotencyKey: "seed" });
+    expect(fake.users.get("u1")!.points).toBe(60);
+
+    const result = await compensateMissingXp(fake.tx, {
+      userId: "u1",
+      supportId: "sup_1",
+      sessionId: "s1",
+      awarded: 60,
+      // reverseSessionLedger found nothing to mirror.
+      alreadyReversed: 0,
+      reason: "support reversed",
+    });
+
+    expect(result.applied).toBe(true);
+    expect(fake.users.get("u1")!.points).toBe(0);
+  });
+
+  it("charges only the shortfall when some entries were still reversible", async () => {
+    await recordXp(fake.tx, { userId: "u1", type: "SUPPORT_COMPLETED", amount: 60, idempotencyKey: "seed" });
+
+    await compensateMissingXp(fake.tx, {
+      userId: "u1",
+      supportId: "sup_1",
+      sessionId: "s1",
+      awarded: 60,
+      // 25 of the 60 was mirrored normally, so only 35 may be taken here.
+      alreadyReversed: 25,
+      reason: "support reversed",
+    });
+
+    expect(fake.users.get("u1")!.points).toBe(25);
+  });
+
+  it("does nothing when the ledger already reversed the whole award", async () => {
+    await recordXp(fake.tx, { userId: "u1", type: "SUPPORT_COMPLETED", amount: 60, idempotencyKey: "seed" });
+
+    const result = await compensateMissingXp(fake.tx, {
+      userId: "u1",
+      supportId: "sup_1",
+      sessionId: "s1",
+      awarded: 60,
+      alreadyReversed: 60,
+      reason: "support reversed",
+    });
+
+    expect(result.applied).toBe(false);
+    expect(fake.users.get("u1")!.points).toBe(60);
+  });
+
+  it("is idempotent, so a retried reversal cannot charge twice", async () => {
+    await recordXp(fake.tx, { userId: "u1", type: "SUPPORT_COMPLETED", amount: 60, idempotencyKey: "seed" });
+
+    for (let i = 0; i < 3; i += 1) {
+      await compensateMissingXp(fake.tx, {
+        userId: "u1",
+        supportId: "sup_1",
+        sessionId: "s1",
+        awarded: 60,
+        alreadyReversed: 0,
+        reason: "support reversed",
+      });
+    }
+
+    expect(fake.users.get("u1")!.points).toBe(0);
+  });
+
+  it("keeps the rollup in step, so the balance audit still reconciles", async () => {
+    await recordXp(fake.tx, { userId: "u1", type: "SUPPORT_COMPLETED", amount: 60, idempotencyKey: "seed" });
+    await compensateMissingXp(fake.tx, {
+      userId: "u1",
+      supportId: "sup_1",
+      sessionId: "s1",
+      awarded: 60,
+      alreadyReversed: 0,
+      reason: "support reversed",
+    });
+
+    const audit = await auditUserBalances(fake.tx, "u1");
+    expect(audit.xp.cached).toBe(0);
+    expect(audit.xp.drift).toBe(0);
+    expect(audit.consistent).toBe(true);
   });
 });

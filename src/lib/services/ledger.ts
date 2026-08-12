@@ -192,12 +192,58 @@ export async function recordXp(
     select: { id: true },
   });
 
+  // Permanent per-day aggregate, written in the same transaction as the detail
+  // entry so the two can never disagree. XpLedger is retained for 7 days; every
+  // window longer than that (monthly leaderboard, all-time, last-week trend) reads
+  // this instead. `increment` makes it correct under concurrency, and a reversal
+  // decrements the same day it lands on, exactly as it does to the balance.
+  await bumpXpRollup(tx, input.userId, input.amount);
+
   const nextLevel = calculateLevel(updated.points);
   const leveledUp = nextLevel > before.level;
   if (nextLevel !== before.level) {
     await tx.user.update({ where: { id: input.userId }, data: { level: nextLevel } });
   }
   return { applied: true, balanceAfter: updated.points, level: nextLevel, leveledUp, entryId: entry.id };
+}
+
+/** Start of the current UTC day, matching UserDailyRollup.day (a DATE column). */
+export function utcDay(at: Date = new Date()): Date {
+  return new Date(Date.UTC(at.getUTCFullYear(), at.getUTCMonth(), at.getUTCDate()));
+}
+
+/**
+ * Adds XP to today's permanent rollup row for a user, creating it if absent.
+ *
+ * Called from inside recordXp's transaction, so it inherits the user row lock and
+ * cannot interleave with another XP write for the same user. `increment` keeps it
+ * correct even if that ever changes.
+ */
+async function bumpXpRollup(tx: Tx, userId: string, amount: number): Promise<void> {
+  const day = utcDay();
+  await tx.userDailyRollup.upsert({
+    where: { userId_day: { userId, day } },
+    create: { userId, day, xp: amount },
+    update: { xp: { increment: amount } },
+  });
+}
+
+/**
+ * Adds abuse severity to today's permanent rollup row.
+ *
+ * Separate from the XP path because abuse signals are written outside the ledger
+ * (see services/anti-abuse.ts), but it lands in the same table for the same
+ * reason: recalculateTrustScore() reads a 30-day window while AbuseSignal itself
+ * is retained for 7 days.
+ */
+export async function bumpAbuseRollup(tx: Tx, userId: string, severity: number): Promise<void> {
+  if (severity <= 0) return;
+  const day = utcDay();
+  await tx.userDailyRollup.upsert({
+    where: { userId_day: { userId, day } },
+    create: { userId, day, abuseSeverity: severity },
+    update: { abuseSeverity: { increment: severity } },
+  });
 }
 
 export type ReputationResult = { applied: boolean; valueAfter: number; rankTier: string; tierChanged: boolean };
@@ -308,15 +354,68 @@ export async function reverseXp(tx: Tx, entryId: string, reason: string): Promis
   });
 }
 
-/** Reverses every credit/XP entry tied to one support session. */
+/**
+ * Reverses every credit/XP entry tied to one support session.
+ *
+ * Returns the XP it actually reversed. That figure matters because XpLedger is
+ * pruned after 7 days while a support can be reversed at any time: for an older
+ * support the detail rows are gone, this finds nothing to mirror, and the caller
+ * must compensate from the permanent record instead. See compensateMissingXp().
+ *
+ * CreditLedger is never pruned, so the credit side is always exact.
+ */
 export async function reverseSessionLedger(tx: Tx, sessionId: string, reason: string) {
   const [credits, xp] = await Promise.all([
     tx.creditLedger.findMany({ where: { sessionId, type: { not: "REVERSAL" } }, select: { id: true } }),
-    tx.xpLedger.findMany({ where: { sessionId, type: { not: "REVERSAL" } }, select: { id: true } }),
+    tx.xpLedger.findMany({ where: { sessionId, type: { not: "REVERSAL" } }, select: { id: true, amount: true } }),
   ]);
   for (const entry of credits) await reverseCredit(tx, entry.id, reason);
-  for (const entry of xp) await reverseXp(tx, entry.id, reason);
-  return { creditEntries: credits.length, xpEntries: xp.length };
+
+  let xpReversed = 0;
+  for (const entry of xp) {
+    const result = await reverseXp(tx, entry.id, reason);
+    if (result.applied) xpReversed += entry.amount;
+  }
+  return { creditEntries: credits.length, xpEntries: xp.length, xpReversed };
+}
+
+/**
+ * Claws back XP whose detail entries no longer exist.
+ *
+ * Reversing a support mirrors each original XpLedger row. Once those rows pass the
+ * 7-day retention window there is nothing to mirror, so a reversal would take back
+ * the credits and leave the XP — inflating User.points permanently and putting it
+ * out of step with UserDailyRollup, which auditUserBalances() would then report as
+ * drift forever.
+ *
+ * The authoritative amount is Support.xpAwarded, a permanent copy written at
+ * settlement. `alreadyReversed` is what reverseSessionLedger() managed to mirror,
+ * so only the shortfall is written here and the two paths cannot double-charge.
+ *
+ * Keyed on the support id, so a retried reversal is a no-op.
+ */
+export async function compensateMissingXp(
+  tx: Tx,
+  input: { userId: string; supportId: string; sessionId: string | null; awarded: number; alreadyReversed: number; reason: string }
+): Promise<XpResult> {
+  const shortfall = input.awarded - input.alreadyReversed;
+  if (shortfall <= 0) {
+    const user = await tx.user.findUniqueOrThrow({
+      where: { id: input.userId },
+      select: { points: true, level: true },
+    });
+    return { applied: false, balanceAfter: user.points, level: user.level, leveledUp: false };
+  }
+
+  return recordXp(tx, {
+    userId: input.userId,
+    type: "REVERSAL",
+    amount: -shortfall,
+    idempotencyKey: ledgerKey(["xp-reversal-compensation", input.supportId]),
+    sessionId: input.sessionId,
+    supportId: input.supportId,
+    reason: `${input.reason} (detail entries beyond retention)`,
+  });
 }
 
 /**
@@ -347,21 +446,30 @@ export async function grantSignupCredits(tx: Tx, userId: string): Promise<Credit
 }
 
 /**
- * Consistency check: recomputes balances from the ledgers and compares them with
- * the cached columns. Exposed to admins so accounting drift is observable rather
- * than assumed impossible.
+ * Consistency check: recomputes balances from the permanent sources and compares
+ * them with the cached columns. Exposed to admins so accounting drift is
+ * observable rather than assumed impossible.
+ *
+ * Credits are reconciled against CreditLedger, which is never subject to
+ * retention — it is the accounting record.
+ *
+ * XP is reconciled against UserDailyRollup, NOT XpLedger. XpLedger is pruned after
+ * 7 days, so summing it would report a growing false "drift" for every user with
+ * older activity and would make this check fire an alarm after each cleanup. The
+ * rollup is permanent and is written in the same transaction as each XpLedger
+ * row, so it carries the same total.
  */
 export async function auditUserBalances(client: Tx, userId: string) {
-  const [creditSum, xpSum, user] = await Promise.all([
+  const [creditSum, xpRollupSum, user] = await Promise.all([
     client.creditLedger.aggregate({ where: { userId }, _sum: { amount: true } }),
-    client.xpLedger.aggregate({ where: { userId }, _sum: { amount: true } }),
+    client.userDailyRollup.aggregate({ where: { userId }, _sum: { xp: true } }),
     client.user.findUniqueOrThrow({ where: { id: userId }, select: { credits: true, points: true } }),
   ]);
   const ledgerCredits = creditSum._sum.amount ?? 0;
-  const ledgerXp = xpSum._sum.amount ?? 0;
+  const rollupXp = xpRollupSum._sum.xp ?? 0;
   return {
     credits: { cached: user.credits, ledger: ledgerCredits, drift: user.credits - ledgerCredits },
-    xp: { cached: user.points, ledger: ledgerXp, drift: user.points - ledgerXp },
-    consistent: user.credits === ledgerCredits && user.points === ledgerXp,
+    xp: { cached: user.points, ledger: rollupXp, drift: user.points - rollupXp },
+    consistent: user.credits === ledgerCredits && user.points === rollupXp,
   };
 }

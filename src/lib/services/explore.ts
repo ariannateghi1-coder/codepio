@@ -7,6 +7,7 @@ import {
   campaignAvailabilityFailure,
   campaignAvailabilityWhere,
 } from "./campaign-eligibility";
+import { utcDay } from "./ledger";
 import {
   EXPLORE_MIX,
   EXPLORE_WEIGHTS,
@@ -641,9 +642,13 @@ export async function recalculateTrustScore(userId: string): Promise<number> {
     }),
     prisma.support.count({ where: { supporterId: userId, status: "REVERSED" } }),
     prisma.report.count({ where: { targetType: "USER", targetId: userId, status: "RESOLVED" } }),
-    prisma.abuseSignal.aggregate({
-      where: { userId, createdAt: { gte: new Date(Date.now() - 30 * 86_400_000) } },
-      _sum: { severity: true },
+    // Reads the permanent 30-day rollup, NOT AbuseSignal. AbuseSignal is retained
+    // for 7 days, so summing it here would let a flagged account's trust score
+    // recover a week after the flags — silently undoing the penalty the anti-abuse
+    // layer applied.
+    prisma.userDailyRollup.aggregate({
+      where: { userId, day: { gte: utcDay(new Date(Date.now() - 30 * 86_400_000)) } },
+      _sum: { abuseSeverity: true },
     }),
   ]);
 
@@ -659,7 +664,7 @@ export async function recalculateTrustScore(userId: string): Promise<number> {
     (user.youtubeVerified ? 10 : 0) -
     8 * reversals -
     12 * upheldReports -
-    1.5 * (signals._sum.severity ?? 0);
+    1.5 * (signals._sum.abuseSeverity ?? 0);
 
   const clamped = Math.max(0, Math.min(100, Math.round(score)));
   await prisma.user.update({ where: { id: userId }, data: { trustScore: clamped } });

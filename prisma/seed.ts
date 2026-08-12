@@ -88,6 +88,19 @@ async function main() {
       },
     });
 
+    // The leaderboard reads UserDailyRollup, not XpLedger, so a seeded creator with
+    // `points` but no rollup row would rank at zero. Seeded to match `points`
+    // exactly, keeping auditUserBalances() consistent in a dev database too.
+    if (creator.points > 0) {
+      const today = new Date();
+      const day = new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate()));
+      await prisma.userDailyRollup.upsert({
+        where: { userId_day: { userId: creator.id, day } },
+        update: { xp: creator.points },
+        create: { userId: creator.id, day, xp: creator.points },
+      });
+    }
+
     const video = await prisma.video.upsert({
       where: { userId_youtubeVideoId: { userId: creator.id, youtubeVideoId: sample.id } },
       update: { durationSec: sample.duration },

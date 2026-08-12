@@ -78,6 +78,54 @@ Netlify با `@netlify/plugin-nextjs`؛ `npm run build` و publish از `.next`.
 4. `npm run prisma:deploy` برای اجرای migration.
 5. `GET /api/v1/health` را بررسی کنید: `ready: false` یعنی چیزی هنوز پیکربندی نشده.
 
-### نگه‌داری زمان‌بندی‌شده
+### نگه‌داری زمان‌بندی‌شده و Retention
 
-مسیر `POST /api/v1/maintenance` پاک‌سازی نشست‌ها، محدودیت‌های منقضی و snapshot جدول امتیازات را انجام می‌دهد و به Bearer token نیاز دارد. این پروژه روی Netlify با Next.js اجرا می‌شود، اما `netlify.toml` به‌تنهایی نمی‌تواند یک درخواست HTTP احراز‌شده به Route Handler را بدون افزودن Scheduled Function و مدیریت secret زمان‌بندی کند. بنابراین عمداً schedule یا credential ساختگی در مخزن اضافه نشده است. در محیط production یک scheduler امن را برای اجرای روزانه این مسیر تنظیم کنید و مقدار `MAINTENANCE_SECRET` را فقط در تنظیمات محرمانه deployment نگه دارید؛ آن را در فایل‌های مخزن قرار ندهید.
+مسیر `POST /api/v1/maintenance` این کارها را انجام می‌دهد و به Bearer token نیاز دارد:
+
+- پاک‌سازی نشست‌های منقضی، rate limit‌ها و توکن‌های یک‌بارمصرف
+- بستن نشست‌های حمایت رهاشده
+- snapshot جدول امتیازات
+- اجرای retention (پاک‌سازی داده‌های موقت و تاریخی)
+
+اجرای آن:
+
+```bash
+MAINTENANCE_URL=https://example.com MAINTENANCE_SECRET=... npm run maintenance
+
+# فقط گزارش بگیر، چیزی حذف نکن
+npm run maintenance:dry-run
+
+# تنظیم اندازه batch و سقف هر اجرا
+node scripts/run-maintenance.mjs --batch-size=500 --max-batches=50
+```
+
+اسکریپت فقط یک درخواست HTTP می‌فرستد و به `DATABASE_URL` نیازی ندارد، پس از crontab روی VPS، یک sidecar در Docker، GitHub Actions یا هر cron خارجی بدون تغییر کار می‌کند. منطق پاک‌سازی داخل اپ است، بنابراین اجرای زمان‌بندی‌شده و اجرای دستی هرگز از هم جدا نمی‌شوند.
+
+پیشنهاد برای cron روزانه:
+
+```
+15 3 * * * MAINTENANCE_URL=https://example.com MAINTENANCE_SECRET=... /usr/bin/node /srv/app/scripts/run-maintenance.mjs >> /var/log/maintenance.log 2>&1
+```
+
+`netlify.toml` به‌تنهایی نمی‌تواند یک درخواست HTTP احراز‌شده را زمان‌بندی کند، پس عمداً schedule یا credential ساختگی در مخزن اضافه نشده است. `MAINTENANCE_SECRET` را فقط در تنظیمات محرمانه deployment نگه دارید.
+
+#### سیاست Retention
+
+| جدول | نگهداری | توضیح |
+| --- | --- | --- |
+| `Notification` | ۳ روز | فقط نمایشی |
+| `Activity` | ۷ روز | فقط فید فعالیت |
+| `AuditLog` | ۷ روز | لاگ عملیاتی، ورودی هیچ تصمیمی نیست |
+| `XpLedger` | ۷ روز | فقط جزئیات؛ مقدار دائمی در `User.points` و `UserDailyRollup` است |
+| `AbuseSignal` | ۷ روز | مگر نشست باز یا در انتظار بررسی مدیر باشد |
+| `WatchSession` | تا نهایی‌شدن نشست + ۲ روز | داده اجرایی موقت |
+| `SupportVerification` | تا نهایی‌شدن نشست + ۲ روز | داده اجرایی موقت |
+| `SupportTask` | تا نهایی‌شدن نشست + ۲ روز | داده اجرایی موقت |
+
+**هرگز حذف نمی‌شوند:** `User`، `Campaign`، `Support`، `CreditLedger`، `UserDailyRollup`، `ReputationEvent`، `SupportSession`، `LeaderboardSnapshot`، موجودی اعتبار، XP، سطح و اعتبار کیفی کاربر.
+
+دو نکته که این سیاست را ممکن می‌کنند:
+
+1. **`UserDailyRollup`** یک ردیف دائمی به‌ازای هر کاربر در هر روز UTC نگه می‌دارد (XP و شدت سیگنال سوءاستفاده). جدول امتیازات (ماهانه/کل)، روند هفتگی داشبورد و پنجره ۳۰ روزه `trustScore` از این می‌خوانند، نه از جدول‌های جزئیات. بدون آن، حذف `XpLedger` باعث می‌شد «ماهانه» یعنی «۷ روز اخیر» و «کل» یعنی «از آخرین پاک‌سازی».
+
+2. **`Support`** نتیجه خودش را کامل نگه می‌دارد: `watchedSec`، `requiredWatchSec`، `riskScore` و خلاصه `verification`. پس بعد از حذف داده‌های موقت هم می‌توان فهمید یک حمایت موفق بوده و چرا پرداخت شده است.

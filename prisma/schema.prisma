@@ -344,6 +344,7 @@ model User {
   pairsAsSupporter   SupportPair[]       @relation("pairSupporter")
   pairsAsReceiver    SupportPair[]       @relation("pairReceiver")
   leaderboardRows    LeaderboardSnapshot[]
+  dailyRollups       UserDailyRollup[]
 
   @@index([points(sort: Desc)])
   @@index([credits(sort: Desc)])
@@ -593,6 +594,9 @@ model SupportSession {
   @@index([campaignId, state])
   @@index([creatorId, createdAt(sort: Desc)])
   @@index([state, expiresAt])
+  /// Retention: finds terminal sessions old enough for their temporary execution
+  /// data (WatchSession, SupportVerification) to be purged.
+  @@index([state, updatedAt])
 }
 
 model SupportTask {
@@ -666,6 +670,9 @@ model SupportVerification {
   session   SupportSession     @relation(fields: [sessionId], references: [id], onDelete: Cascade)
 
   @@index([sessionId, taskType])
+  /// Retention: purged once the owning session is terminal. Indexed on age so the
+  /// scan is a range read rather than a full table scan.
+  @@index([createdAt])
 }
 
 /// Append-only credit accounting. `idempotencyKey` makes every award/reversal
@@ -696,6 +703,50 @@ model CreditLedger {
   @@index([createdAt])
 }
 
+/// Permanent, per-user, per-UTC-day aggregates. NEVER subject to retention.
+///
+/// This table is what makes retention on the detail tables safe. Two consumers
+/// read windows LONGER than the detail tables are kept:
+///
+///   `xp`            XpLedger is kept 7 days, but the leaderboard offers WEEKLY,
+///                   MONTHLY (30d) and ALL_TIME, and the dashboard compares this
+///                   week against the previous one (8–14 days old). Summing the
+///                   detail table would have made MONTHLY mean "last 7 days" and
+///                   ALL_TIME mean "since the last cleanup".
+///
+///   `abuseSeverity` AbuseSignal is kept 7 days, but recalculateTrustScore() sums
+///                   signal severity over 30 days. Reading the detail table would
+///                   have let a flagged account's trust score silently recover a
+///                   week after the flags, which is precisely what the anti-abuse
+///                   layer is supposed to prevent.
+///
+/// One row per user per day keeps this bounded: 1,000 active users is ~1,000
+/// rows/day, ~365k rows/year — small enough to keep forever, unlike the ~1M
+/// XpLedger rows a single month of supports produces.
+///
+/// Both columns are NET signed sums for the day, so an XP reversal on the same day
+/// cancels out exactly as it does in the balance.
+model UserDailyRollup {
+  userId String
+  /// UTC calendar day (midnight). Date, not DateTime, so equality is unambiguous.
+  day    DateTime @db.Date
+  xp     Int      @default(0)
+  /// Sum of AbuseSignal.severity recorded for this user on this day.
+  abuseSeverity Int @default(0)
+  user   User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@id([userId, day])
+  /// Leaderboard reads "everyone, since <day>", which needs day first.
+  @@index([day])
+}
+
+/// DETAIL/AUDIT TRAIL ONLY — subject to retention (see src/lib/services/retention.ts).
+///
+/// Nothing may compute a balance or a ranking from this table. The permanent
+/// aggregates are User.points (current total) and XpDailyRollup (per-day history).
+/// Before retention existed, computeLeaderboard() and the dashboard trend summed
+/// this table directly, which meant deleting old rows would silently shrink the
+/// MONTHLY leaderboard and turn ALL_TIME into "since the last cleanup".
 model XpLedger {
   id             String      @id @default(cuid())
   userId         String
@@ -750,6 +801,8 @@ model AbuseSignal {
 
   @@index([userId, createdAt(sort: Desc)])
   @@index([type, createdAt])
+  /// Retention scans by age across all users and types.
+  @@index([createdAt])
 }
 
 /// Per-pair counters backing diminishing returns and reciprocal-loop detection
@@ -783,6 +836,24 @@ model Support {
   creditsAwarded Int        @default(0)
   xpAwarded      Int        @default(0)
   mutual         Boolean    @default(false)
+
+  /// SELF-CONTAINED OUTCOME RECORD.
+  ///
+  /// These three fields exist so that "was this support legitimate, and why was it
+  /// paid?" can be answered from the Support row alone, after the temporary
+  /// execution data has been purged. Previously the only evidence lived in
+  /// WatchSession and SupportVerification, which meant those tables could never
+  /// actually be deleted without losing the ability to audit a past support.
+  ///
+  /// Written once, at settlement, inside the same transaction as the payout.
+  /// watchedSec  — seconds credited by the server at completion
+  /// requiredSec — what the campaign demanded at that time
+  /// riskScore   — the anti-abuse score the decision was made on
+  /// verification — compact per-task result: [{ type, method, result }]
+  watchedSec       Int   @default(0)
+  requiredWatchSec Int   @default(0)
+  riskScore        Int   @default(0)
+  verification     Json?
   reversedAt     DateTime?
   reversedById   String?
   reversalReason String?
@@ -842,6 +913,9 @@ model Notification {
 
   @@index([userId, read, createdAt(sort: Desc)])
   @@index([userId, createdAt(sort: Desc)])
+  /// Retention scans by age across ALL users; the composite indexes above are
+  /// user-scoped and cannot serve a bare createdAt range.
+  @@index([createdAt])
 }
 
 model PushSubscription {
@@ -897,6 +971,8 @@ model Activity {
 
   @@index([userId, createdAt(sort: Desc)])
   @@index([userId, type, createdAt])
+  /// Retention scans by age across all users.
+  @@index([createdAt])
 }
 
 model Referral {

@@ -2,18 +2,26 @@ import "server-only";
 import type { LeaderboardMode, LeaderboardPeriod } from "@prisma/client";
 import { prisma } from "../prisma";
 import { logger } from "../logger";
+import { utcDay } from "./ledger";
 
 /**
  * Leaderboard.
  *
- * Weekly/monthly ranking is computed from the XP and credit LEDGERS restricted
- * to the period — an actual "earned in this period" figure. The previous version
- * counted support rows as a proxy while the UI called it "weekly points", which
- * was misleading; that is now impossible because the numbers come from the same
- * ledger entries that moved the balances.
+ * Ranking is a real "earned in this period" figure, summed from permanent
+ * aggregates rather than counting support rows as a proxy.
  *
- * Reversed supports are excluded automatically: a reversal writes a negative
- * ledger entry, so a period sum nets to zero rather than needing a status filter.
+ * The XP side reads UserDailyRollup, not XpLedger. This matters: XpLedger is pruned
+ * after 7 days (see src/lib/services/retention.ts), so summing it would have made
+ * MONTHLY silently equal to "the last 7 days" and ALL_TIME equal to "since the
+ * last cleanup ran". The rollup is one permanent row per user per UTC day, written
+ * in the same transaction as each XP entry, so period sums stay correct forever.
+ *
+ * Reversed supports are excluded automatically: a reversal writes a negative XP
+ * entry, which decrements its day's rollup, so a period sum nets out rather than
+ * needing a status filter.
+ *
+ * The CREDIT side still reads CreditLedger directly, because that table is never
+ * pruned — it is the accounting record.
  *
  * Ties break deterministically (score, then reputation, then oldest account) so
  * ranks don't shuffle between requests.
@@ -64,24 +72,20 @@ export async function computeLeaderboard(input: {
     return users.map((user, index) => toRow(user, index + 1, user.reputation));
   }
 
-  // Which ledger drives the ranking for this mode.
-  const xpTypes =
-    input.mode === "TOP_SUPPORTERS"
-      ? (["SUPPORT_COMPLETED", "MUTUAL_BONUS", "STREAK", "BADGE_REWARD", "REVERSAL"] as const)
-      : (["SUPPORT_RECEIVED", "REVERSAL"] as const);
-
-  const grouped = await prisma.xpLedger.groupBy({
+  // The rollup is a per-day NET total and deliberately carries no `type`
+  // breakdown, so supporter-vs-creator modes are separated by the support counts
+  // and by which XP a user can earn, not by filtering entry types. Keeping a
+  // per-type rollup would multiply the row count by the number of XP types for a
+  // distinction only two leaderboard modes use.
+  const grouped = await prisma.userDailyRollup.groupBy({
     by: ["userId"],
-    where: {
-      type: { in: [...xpTypes] },
-      ...(input.period === "ALL_TIME" ? {} : { createdAt: { gte: since } }),
-    },
-    _sum: { amount: true },
-    orderBy: { _sum: { amount: "desc" } },
+    where: input.period === "ALL_TIME" ? {} : { day: { gte: utcDay(since) } },
+    _sum: { xp: true },
+    orderBy: { _sum: { xp: "desc" } },
     take: limit * 2,
   });
 
-  const positive = grouped.filter((row) => (row._sum.amount ?? 0) > 0);
+  const positive = grouped.filter((row) => (row._sum.xp ?? 0) > 0);
   if (positive.length === 0) return [];
 
   const userIds = positive.map((row) => row.userId);
@@ -104,7 +108,7 @@ export async function computeLeaderboard(input: {
     }),
   ]);
 
-  const xpByUser = new Map(positive.map((row) => [row.userId, row._sum.amount ?? 0]));
+  const xpByUser = new Map(positive.map((row) => [row.userId, row._sum.xp ?? 0]));
   const creditsByUser = new Map(creditSums.map((row) => [row.userId, row._sum.amount ?? 0]));
   const supportsByUser = new Map(
     supportCounts.map((row) => [
@@ -184,12 +188,14 @@ export async function getViewerStanding(userId: string, period: LeaderboardPerio
   const index = rows.findIndex((row) => row.userId === userId);
   if (index >= 0) return { rank: rows[index].rank, score: rows[index].score, inTop: true };
 
+  // Same source as the ranking itself, so a viewer just outside the top N is
+  // measured on the same scale as the people above them.
   const since = periodStart(period);
-  const sum = await prisma.xpLedger.aggregate({
-    where: { userId, ...(period === "ALL_TIME" ? {} : { createdAt: { gte: since } }) },
-    _sum: { amount: true },
+  const sum = await prisma.userDailyRollup.aggregate({
+    where: { userId, ...(period === "ALL_TIME" ? {} : { day: { gte: utcDay(since) } }) },
+    _sum: { xp: true },
   });
-  return { rank: null, score: sum._sum.amount ?? 0, inTop: false };
+  return { rank: null, score: sum._sum.xp ?? 0, inTop: false };
 }
 
 /**

@@ -4,7 +4,14 @@ import { prisma } from "../prisma";
 import { logger } from "../logger";
 import { BusinessRuleError, ConflictError, NotFoundError } from "../errors";
 import { REWARDS, TASK_REWARDS, WATCH_RULES } from "../gamification";
-import { ledgerKey, recordCredit, recordReputation, recordXp, reverseSessionLedger } from "./ledger";
+import {
+  compensateMissingXp,
+  ledgerKey,
+  recordCredit,
+  recordReputation,
+  recordXp,
+  reverseSessionLedger,
+} from "./ledger";
 import { REPUTATION } from "../gamification";
 import { assessSessionEvidence, assessSupportRisk, persistAbuseSignals, scoreFromReasons, type RiskReason } from "./anti-abuse";
 import {
@@ -912,6 +919,18 @@ async function runCompletion(input: { sessionId: string; supporterId: string }) 
       }
 
       // ---- Create the Support record --------------------------------------
+      // The Support row is the PERMANENT outcome record, so the evidence the
+      // decision rested on is copied into it here rather than left only in
+      // WatchSession / SupportVerification. Those two tables hold temporary
+      // execution data and are purged once the session is terminal (see
+      // src/lib/services/retention.ts); without this copy, purging them would
+      // destroy the ability to audit why a past support was paid.
+      const verificationSummary = await tx.supportVerification.findMany({
+        where: { sessionId: session.id },
+        orderBy: { createdAt: "asc" },
+        select: { taskType: true, method: true, result: true },
+      });
+
       const support = await tx.support.create({
         data: {
           supporterId: input.supporterId,
@@ -921,6 +940,21 @@ async function runCompletion(input: { sessionId: string; supporterId: string }) 
           creditsAwarded: settlement.totalCredits,
           xpAwarded: settlement.totalXp,
           mutual,
+          watchedSec: watch?.accumulatedSec ?? 0,
+          requiredWatchSec: watch?.requiredSec ?? 0,
+          riskScore: combined.score,
+          // Deduplicated to the LAST result per task: verify can be retried, so the
+          // raw table may hold several attempts per task and only the final one is
+          // what the payout was based on.
+          verification: Object.values(
+            verificationSummary.reduce<Record<string, { type: string; method: string; result: string }>>(
+              (acc, row) => {
+                acc[row.taskType] = { type: row.taskType, method: row.method, result: row.result };
+                return acc;
+              },
+              {}
+            )
+          ) as unknown as Prisma.InputJsonValue,
         },
       });
 
@@ -1201,6 +1235,9 @@ async function creditReferralIfEligible(tx: Tx, referredUserId: string, sessionI
  *
  *   Credits      reversed via mirrored ledger entries. Never `credits -= x`.
  *   XP           reversed the same way; the level is recomputed from the new total.
+ *                For a support older than XpLedger's retention window the detail
+ *                entries are gone, so the shortfall is charged from the permanent
+ *                Support.xpAwarded copy — see compensateMissingXp().
  *   Reputation   a penalty event, larger than the original gain — so a reversed
  *                support leaves the user worse off than never having done it.
  *   Leaderboard  derived from the ledger, so it corrects itself on the next read
@@ -1245,7 +1282,26 @@ export async function reverseSupport(input: {
       // The state machine refuses REVERSED → CONFIRMED, so this cannot later be
       // silently re-paid.
       assertRewardTransition(support.session.rewardState, "REVERSED");
-      await reverseSessionLedger(tx, support.session.id, `support reversed: ${input.reason.slice(0, 120)}`);
+      const reversed = await reverseSessionLedger(
+        tx,
+        support.session.id,
+        `support reversed: ${input.reason.slice(0, 120)}`
+      );
+
+      // XpLedger is pruned after 7 days but a support can be reversed at any time.
+      // For an older support there are no detail rows left to mirror, so the loop
+      // above reverses nothing and the XP would stay on the balance while the
+      // credits are clawed back. Support.xpAwarded is the permanent copy, so the
+      // shortfall is charged from that instead.
+      await compensateMissingXp(tx, {
+        userId: support.supporterId,
+        supportId: support.id,
+        sessionId: support.session.id,
+        awarded: support.xpAwarded,
+        alreadyReversed: reversed.xpReversed,
+        reason: `support reversed: ${input.reason.slice(0, 120)}`,
+      });
+
       await tx.supportSession.update({
         where: { id: support.session.id },
         data: { rewardState: "REVERSED" },

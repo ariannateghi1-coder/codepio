@@ -1,6 +1,7 @@
 import "server-only";
 import type { AbuseSignalType, Prisma } from "@prisma/client";
 import { PAIR_COOLDOWN_HOURS, RISK_THRESHOLDS } from "../gamification";
+import { bumpAbuseRollup } from "./ledger";
 
 /**
  * Anti-abuse engine.
@@ -372,7 +373,23 @@ async function loadGraphFeatures(tx: Tx, supporterId: string, receiverId: string
   };
 }
 
-/** Persists signals so moderators can review patterns rather than single events. */
+/**
+ * Persists signals so moderators can review patterns rather than single events.
+ *
+ * Writes TWO places, deliberately:
+ *
+ *   AbuseSignal      the individual, inspectable event — retained 7 days (or until
+ *                    the session it belongs to is resolved), because a moderator
+ *                    reviewing a specific case needs the detail.
+ *
+ *   UserDailyRollup  a permanent per-day severity total. recalculateTrustScore()
+ *                    sums severity over 30 days; if it read AbuseSignal directly, a
+ *                    flagged account's trust score would quietly recover a week
+ *                    after being flagged, once retention removed the evidence.
+ *
+ * Both writes are in the caller's transaction, so a signal can never be recorded
+ * without its permanent aggregate.
+ */
 export async function persistAbuseSignals(
   tx: Tx,
   input: { userId: string; sessionId?: string | null; reasons: RiskReason[] }
@@ -387,4 +404,6 @@ export async function persistAbuseSignals(
       metadata: { note: reason.note },
     })),
   });
+  const totalSeverity = input.reasons.reduce((sum, reason) => sum + Math.max(0, reason.severity), 0);
+  await bumpAbuseRollup(tx, input.userId, totalSeverity);
 }

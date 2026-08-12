@@ -18,7 +18,9 @@
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
     "prisma:deploy": "prisma migrate deploy",
-    "prisma:seed": "tsx prisma/seed.ts"
+    "prisma:seed": "tsx prisma/seed.ts",
+    "maintenance": "node scripts/run-maintenance.mjs",
+    "maintenance:dry-run": "node scripts/run-maintenance.mjs --dry-run"
   },
   "dependencies": {
     "@netlify/plugin-nextjs": "^5.8.1",

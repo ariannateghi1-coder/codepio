@@ -3,14 +3,17 @@ import { authed } from "@/lib/handler";
 import { nextLevelProgress, rankTierLabel } from "@/lib/gamification";
 import { getExploreFeed } from "@/lib/services/explore";
 import { getViewerStanding } from "@/lib/services/leaderboard";
+import { utcDay } from "@/lib/services/ledger";
 
 /**
  * Dashboard.
  *
  * Every number here has a real source: counts filter on status ACTIVE, credits and
- * XP come from the cached balances the ledger maintains, the period figure comes
- * from the ledger itself, and the trend is a genuine week-over-week comparison.
- * Nothing is a placeholder.
+ * XP come from the cached balances the ledger maintains, and the trend is a genuine
+ * week-over-week comparison. Nothing is a placeholder.
+ *
+ * Period XP figures read UserDailyRollup (permanent) rather than XpLedger (retained
+ * 7 days), so the trend does not reset when cleanup runs.
  *
  * All queries are issued in one Promise.all so the page is a single round of
  * parallel reads rather than a waterfall.
@@ -43,10 +46,17 @@ export const GET = authed(
       prisma.support.count({ where: { supporterId: user.id, status: "REVERSED" } }),
       prisma.notification.count({ where: { userId: user.id, read: false } }),
       prisma.supportSession.count({ where: { supporterId: user.id, rewardState: "PENDING_REVIEW" } }),
-      prisma.xpLedger.aggregate({ where: { userId: user.id, createdAt: { gte: weekAgo } }, _sum: { amount: true } }),
-      prisma.xpLedger.aggregate({
-        where: { userId: user.id, createdAt: { gte: twoWeeksAgo, lt: weekAgo } },
-        _sum: { amount: true },
+      // Both windows read XpDailyRollup, not XpLedger. The previous-week window is
+      // 8–14 days old, which is entirely outside XpLedger's 7-day retention — read
+      // from the detail table it would have reported 0 and shown every user as
+      // having a huge positive trend right after each cleanup.
+      prisma.userDailyRollup.aggregate({
+        where: { userId: user.id, day: { gte: utcDay(weekAgo) } },
+        _sum: { xp: true },
+      }),
+      prisma.userDailyRollup.aggregate({
+        where: { userId: user.id, day: { gte: utcDay(twoWeeksAgo), lt: utcDay(weekAgo) } },
+        _sum: { xp: true },
       }),
       prisma.notification.findMany({
         where: { userId: user.id },
@@ -93,8 +103,8 @@ export const GET = authed(
     ]);
 
     const attempts = user.supportsCompleted + user.supportsAbandoned;
-    const weekXp = thisWeekXp._sum.amount ?? 0;
-    const previousXp = lastWeekXp._sum.amount ?? 0;
+    const weekXp = thisWeekXp._sum.xp ?? 0;
+    const previousXp = lastWeekXp._sum.xp ?? 0;
 
     // Wallet: credits behave like a real currency, so the user can see where the
     // balance came from and where it went, not just a single number.

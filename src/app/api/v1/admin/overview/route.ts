@@ -49,7 +49,10 @@ export const GET = moderator(
       Promise.all([
         prisma.user.aggregate({ _sum: { credits: true, points: true } }),
         prisma.creditLedger.aggregate({ _sum: { amount: true } }),
-        prisma.xpLedger.aggregate({ _sum: { amount: true } }),
+        // UserDailyRollup, not XpLedger: the detail table is pruned after 7 days, so
+        // comparing it against User.points would report platform-wide XP "drift"
+        // that grows with every cleanup run and would keep the alarm permanently on.
+        prisma.userDailyRollup.aggregate({ _sum: { xp: true } }),
         // Credits sitting in campaign escrow: debited from creators, not yet
         // transferred to supporters. Needed to state total supply correctly.
         prisma.campaign.aggregate({
@@ -80,7 +83,7 @@ export const GET = moderator(
         cachedCredits: userTotals._sum.credits ?? 0,
         ledgerCredits: creditTotals._sum.amount ?? 0,
         cachedXp: userTotals._sum.points ?? 0,
-        ledgerXp: xpTotals._sum.amount ?? 0,
+        ledgerXp: xpTotals._sum.xp ?? 0,
         /** Credits held in campaign budgets, i.e. debited but not yet transferred. */
         escrowedCredits: escrowed,
         /**
@@ -90,7 +93,7 @@ export const GET = moderator(
         totalSupply: (userTotals._sum.credits ?? 0) + escrowed,
         consistent:
           (userTotals._sum.credits ?? 0) === (creditTotals._sum.amount ?? 0) &&
-          (userTotals._sum.points ?? 0) === (xpTotals._sum.amount ?? 0),
+          (userTotals._sum.points ?? 0) === (xpTotals._sum.xp ?? 0),
       },
       systemHealth: productionReadiness(),
     };
