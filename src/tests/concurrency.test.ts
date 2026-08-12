@@ -39,7 +39,21 @@ const SUFFIX = `ct${Date.now().toString(36)}`;
 const CAPACITY = 5;
 const SUPPORTER_COUNT = 25;
 
-type Seeded = { creatorId: string; campaignId: string; supporterIds: string[] };
+type Seeded = {
+  creatorId: string;
+  campaignId: string;
+  /**
+   * A second, separately funded campaign, used by the heartbeat test.
+   *
+   * The burst test deliberately drains `campaignId` to exactly zero remaining
+   * budget — that is the invariant it proves. Starting another session on it
+   * therefore fails eligibility with CAMPAIGN_BUDGET_EXHAUSTED before a single
+   * heartbeat can be sent, which says nothing about heartbeat accounting. Watch
+   * state gets its own funded campaign so the two tests stay independent.
+   */
+  heartbeatCampaignId: string;
+  supporterIds: string[];
+};
 
 async function seed(client: PrismaClient): Promise<Seeded> {
   const passwordHash = await hashPassword("ConcurrencyTest2026!");
@@ -86,6 +100,25 @@ async function seed(client: PrismaClient): Promise<Seeded> {
     },
   });
 
+  const heartbeatCampaign = await client.campaign.create({
+    data: {
+      creatorId: creator.id,
+      videoId: video.id,
+      title: "Concurrency campaign heartbeat",
+      startAt: new Date(Date.now() - 3600_000),
+      endAt: new Date(Date.now() + 86_400_000),
+      status: "ACTIVE",
+      requiredWatchPercent: 90,
+      rewardCredits: SUPPORT_TRANSFER_CREDITS,
+      rewardXp: 25,
+      // Funded for a single transfer: enough to start one session, which is all
+      // the heartbeat test needs.
+      budgetCredits: SUPPORT_TRANSFER_CREDITS,
+      maxTotalSupports: 1,
+      tasks: { create: [{ type: "WATCH_VIDEO", required: true, sortOrder: 0 }] },
+    },
+  });
+
   const supporterIds: string[] = [];
   for (let i = 0; i < SUPPORTER_COUNT; i += 1) {
     const supporter = await client.user.create({
@@ -103,7 +136,12 @@ async function seed(client: PrismaClient): Promise<Seeded> {
     supporterIds.push(supporter.id);
   }
 
-  return { creatorId: creator.id, campaignId: campaign.id, supporterIds };
+  return {
+    creatorId: creator.id,
+    campaignId: campaign.id,
+    heartbeatCampaignId: heartbeatCampaign.id,
+    supporterIds,
+  };
 }
 
 /** Marks the watch task satisfied without pretending the user watched anything. */
@@ -138,7 +176,7 @@ async function satisfyWatch(client: PrismaClient, sessionId: string) {
 
 async function cleanup(client: PrismaClient) {
   // Cascades from User/Campaign remove sessions, tasks, ledger rows and supports.
-  await client.campaign.deleteMany({ where: { title: "Concurrency campaign" } });
+  await client.campaign.deleteMany({ where: { title: { startsWith: "Concurrency campaign" } } });
   await client.user.deleteMany({ where: { email: { contains: SUFFIX } } });
 }
 
@@ -267,7 +305,7 @@ describe.skipIf(!enabled)("support completion under concurrency", () => {
       // whatever the concurrency burst left behind.
       const started = await startSupportSession({
         supporterId: fixture.supporterIds[SUPPORTER_COUNT - 1],
-        campaignId: fixture.campaignId,
+        campaignId: fixture.heartbeatCampaignId,
         ipHash: null,
         userAgentHash: null,
       });
@@ -275,7 +313,25 @@ describe.skipIf(!enabled)("support completion under concurrency", () => {
       const supporterId = fixture.supporterIds[SUPPORTER_COUNT - 1];
 
       // Two legitimate beats, spaced by real time.
-      await recordWatchHeartbeat({ sessionId, supporterId, position: 5, playerState: "PLAYING", sequence: 1 });
+      //
+      // startSupportSession() stamps lastHeartbeatAt with "now", and the cadence
+      // gate rejects anything arriving faster than a quarter of the expected
+      // interval. Both beats are therefore backdated: without this the very first
+      // beat is rejected as TOO_FREQUENT, and the rejectedBeats assertion below
+      // would be counting that instead of the replay and the stale beat it is
+      // meant to be about.
+      await client.watchSession.update({
+        where: { sessionId },
+        data: { lastHeartbeatAt: new Date(Date.now() - 10_000) },
+      });
+      const first = await recordWatchHeartbeat({
+        sessionId,
+        supporterId,
+        position: 5,
+        playerState: "PLAYING",
+        sequence: 1,
+      });
+      expect(first.rejected).toBe(false);
       await client.watchSession.update({
         where: { sessionId },
         data: { lastHeartbeatAt: new Date(Date.now() - 10_000) },

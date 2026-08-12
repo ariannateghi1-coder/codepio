@@ -94,9 +94,20 @@ function createFakeTx() {
         return Promise.resolve({ id: row.id });
       },
       findUnique({ where }: { where: Record<string, unknown> }) {
+        // Every unique lookup the ledger actually performs must be modelled here.
+        // `idempotencyKey` is the important one: recordCredit/recordXp pre-check it
+        // and return applied:false on a hit. A fake that always missed would send
+        // the replay on to create(), turning idempotency into a P2002 throw — which
+        // is the opposite of the behaviour under test.
         const row =
           store.find((entry) =>
-            "id" in where ? entry.id === where.id : "reversalOfId" in where ? entry.reversalOfId === where.reversalOfId : false
+            "id" in where
+              ? entry.id === where.id
+              : "idempotencyKey" in where
+                ? entry.idempotencyKey === where.idempotencyKey
+                : "reversalOfId" in where
+                  ? entry.reversalOfId === where.reversalOfId
+                  : false
           ) ?? null;
         return Promise.resolve(row);
       },
@@ -420,7 +431,7 @@ describe("XP rollup — what makes XpLedger retention safe", () => {
 
   it("writes a permanent per-day aggregate alongside every XP entry", async () => {
     await recordXp(fake.tx, { userId: "u1", type: "SUPPORT_COMPLETED", amount: 25, idempotencyKey: "x1" });
-    const rollup = await fake.tx.userDailyRollup.aggregate({ where: { userId: "u1" } });
+    const rollup = await fake.tx.userDailyRollup.aggregate({ where: { userId: "u1" }, _sum: { xp: true } });
     expect(rollup._sum.xp).toBe(25);
     expect(fake.rollups.size).toBe(1);
   });
@@ -429,14 +440,14 @@ describe("XP rollup — what makes XpLedger retention safe", () => {
     await recordXp(fake.tx, { userId: "u1", type: "SUPPORT_COMPLETED", amount: 25, idempotencyKey: "x1" });
     await recordXp(fake.tx, { userId: "u1", type: "MUTUAL_BONUS", amount: 10, idempotencyKey: "x2" });
     expect(fake.rollups.size).toBe(1);
-    const rollup = await fake.tx.userDailyRollup.aggregate({ where: { userId: "u1" } });
+    const rollup = await fake.tx.userDailyRollup.aggregate({ where: { userId: "u1" }, _sum: { xp: true } });
     expect(rollup._sum.xp).toBe(35);
   });
 
   it("does not double count a replayed idempotency key", async () => {
     await recordXp(fake.tx, { userId: "u1", type: "SUPPORT_COMPLETED", amount: 25, idempotencyKey: "x1" });
     await recordXp(fake.tx, { userId: "u1", type: "SUPPORT_COMPLETED", amount: 25, idempotencyKey: "x1" });
-    const rollup = await fake.tx.userDailyRollup.aggregate({ where: { userId: "u1" } });
+    const rollup = await fake.tx.userDailyRollup.aggregate({ where: { userId: "u1" }, _sum: { xp: true } });
     expect(rollup._sum.xp).toBe(25);
   });
 
@@ -450,7 +461,7 @@ describe("XP rollup — what makes XpLedger retention safe", () => {
     await reverseXp(fake.tx, original.entryId!, "support reversed");
 
     expect(fake.users.get("u1")!.points).toBe(0);
-    const rollup = await fake.tx.userDailyRollup.aggregate({ where: { userId: "u1" } });
+    const rollup = await fake.tx.userDailyRollup.aggregate({ where: { userId: "u1" }, _sum: { xp: true } });
     expect(rollup._sum.xp).toBe(0);
   });
 
