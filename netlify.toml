@@ -1,15 +1,18 @@
 [build]
-  command = "npm run build"
+  command = "prisma migrate deploy && npm run build"
   publish = ".next"
 
 [build.environment]
-  NODE_VERSION = "20"
+  NODE_VERSION = "22"
 
 [[plugins]]
   package = "@netlify/plugin-nextjs"
 
+# Production is the only context that applies migrations. Preview and branch
+# deploys share this DATABASE_URL, so letting them migrate would apply a
+# branch's unreviewed migration to the production database.
 [context.production]
-  command = "npm run build"
+  command = "prisma migrate deploy && npm run build"
   publish = ".next"
 
 [context.deploy-preview]
