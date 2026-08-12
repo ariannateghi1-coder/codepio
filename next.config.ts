@@ -1,15 +1,6 @@
 import type { NextConfig } from "next";
-import { createHash } from "node:crypto";
 
 const isProd = process.env.NODE_ENV === "production";
-const themeScript = `(function(){try{
-var stored=localStorage.getItem('theme');
-var mode=(stored==='light'||stored==='dark'||stored==='system')?stored:'system';
-var dark=mode==='dark'||(mode==='system'&&window.matchMedia('(prefers-color-scheme: dark)').matches);
-document.documentElement.classList.toggle('dark',dark);
-document.documentElement.dataset.themePreference=mode;
-}catch(e){}})();`;
-const themeScriptHash = createHash("sha256").update(themeScript).digest("base64");
 
 /**
  * Content Security Policy.
@@ -17,9 +8,18 @@ const themeScriptHash = createHash("sha256").update(themeScript).digest("base64"
  * Scoped to the origins the app actually talks to, nothing more:
  *   frame-src   — youtube-nocookie only, which is why every embed must be built
  *                 through youtubeEmbedUrl(); a youtube.com embed is blocked.
- *   script-src  — self plus the IFrame Player API. 'unsafe-inline' is required by
- *                 the pre-paint theme script; 'unsafe-eval' is dev-only (React
- *                 refresh) and never shipped to production.
+ *   script-src  — self plus the IFrame Player API. 'unsafe-inline' is required
+ *                 twice over: by the pre-paint theme script in layout.tsx, and
+ *                 by the inline bootstrap scripts the App Router streams on
+ *                 every response (`self.__next_f.push(...)`), which carry the
+ *                 RSC payload React needs to hydrate. Those are generated per
+ *                 render, so a static SHA-256 allow-list cannot cover them —
+ *                 and because CSP Level 3 makes any hash or nonce *disable*
+ *                 'unsafe-inline', a hash here would silently block hydration
+ *                 and blank the page. Tightening this needs per-request nonces
+ *                 from middleware, which forces every route to render
+ *                 dynamically; see the note in middleware.ts.
+ *                 'unsafe-eval' is dev-only (React refresh) and never shipped.
  *   connect-src — our own API, Ably (realtime), and the Google APIs the server
  *                 proxies for OAuth token exchange.
  *   img-src     — YouTube thumbnails and Google avatars, plus data: for inline SVG.
@@ -34,7 +34,7 @@ const csp = [
   "frame-ancestors 'none'",
   "object-src 'none'",
   "img-src 'self' data: blob: https://i.ytimg.com https://*.ytimg.com https://*.googleusercontent.com https://yt3.ggpht.com",
-  `script-src 'self' 'sha256-${themeScriptHash}'${isProd ? "" : " 'unsafe-eval'"} https://www.youtube.com https://s.ytimg.com`,
+  `script-src 'self' 'unsafe-inline'${isProd ? "" : " 'unsafe-eval'"} https://www.youtube.com https://s.ytimg.com`,
   "style-src 'self' 'unsafe-inline'",
   "font-src 'self' data:",
   "frame-src https://www.youtube-nocookie.com",
