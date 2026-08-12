@@ -7,6 +7,8 @@ import { getClientIp, hashIp } from "@/lib/http";
 import { writeAudit } from "@/lib/audit";
 import { ConflictError } from "@/lib/errors";
 import { logger } from "@/lib/logger";
+import { grantSignupCredits } from "@/lib/services/ledger";
+import { SIGNUP_GRANT_CREDITS } from "@/lib/gamification";
 import { Prisma } from "@prisma/client";
 
 /** Registration creates an ACTIVE account and signs it in immediately. */
@@ -56,6 +58,22 @@ export const POST = route("auth.register", async (req) => {
     }
   }
   if (!user) throw new ConflictError("ثبت‌نام ناموفق بود. دوباره تلاش کنید.");
+  // Bound to a const because narrowing of a mutable `let` is not preserved inside
+  // the transaction callback below.
+  const created = user;
+
+  // One-time credit grant. Credits are a closed transfer economy, so this is the
+  // ONLY place they enter the system — and it is what lets a new account fund a
+  // first campaign before having earned anything. Written through the ledger, so
+  // User.credits stays reconcilable against SUM(CreditLedger.amount).
+  //
+  // Deliberately non-fatal: an account that exists but is un-granted is fully
+  // recoverable, because the idempotency key is per-user and the grant can be
+  // reapplied later. Failing registration here would instead leave the user with a
+  // created account, no session, and a username that is now taken.
+  await prisma
+    .$transaction((tx) => grantSignupCredits(tx, created.id))
+    .catch((e) => logger.error("failed to grant signup credits", { userId: created.id, error: e }));
 
   // Referral is recorded now but PAID only after the referred user completes a
   // verified support (see support service), which is what makes throwaway
@@ -74,5 +92,7 @@ export const POST = route("auth.register", async (req) => {
 
   return ok({
     user: { id: user.id, username: user.username, name: user.name, email: user.email, role: user.role },
+    /** So the UI can state what was granted, instead of credits just appearing. */
+    signupGrantCredits: SIGNUP_GRANT_CREDITS,
   });
 });

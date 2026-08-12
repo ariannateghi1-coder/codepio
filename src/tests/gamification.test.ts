@@ -6,6 +6,8 @@ import {
   RANK_TIERS,
   REPUTATION,
   REWARDS,
+  SIGNUP_GRANT_CREDITS,
+  SUPPORT_TRANSFER_CREDITS,
   TASK_REWARDS,
   calculateLevel,
   calculateRankTier,
@@ -88,11 +90,34 @@ describe("pair diminishing returns", () => {
 describe("reward configuration", () => {
   it("keeps every reward non-negative", () => {
     for (const reward of Object.values(TASK_REWARDS)) {
-      expect(reward.credits).toBeGreaterThanOrEqual(0);
       expect(reward.xp).toBeGreaterThanOrEqual(0);
     }
-    expect(REWARDS.SUPPORT_COMPLETED.credits).toBeGreaterThan(0);
-    expect(REWARDS.SUPPORT_RECEIVED.credits).toBeGreaterThan(0);
+    expect(REWARDS.SUPPORT_COMPLETED.xp).toBeGreaterThan(0);
+    expect(REWARDS.SUPPORT_RECEIVED.xp).toBeGreaterThan(0);
+  });
+
+  it("exposes credits ONLY on the support transfer", () => {
+    // Every other reward is XP. A `credits` field reappearing on any of them means
+    // a credit source with no paying counterparty — see CREDIT CONSERVATION.
+    expect(REWARDS.SUPPORT_COMPLETED.credits).toBe(SUPPORT_TRANSFER_CREDITS);
+    expect(REWARDS.SUPPORT_RECEIVED).not.toHaveProperty("credits");
+    expect(REWARDS.MUTUAL_BONUS).not.toHaveProperty("credits");
+    expect(REWARDS.REFERRAL).not.toHaveProperty("credits");
+    for (const milestone of Object.values(REWARDS.STREAK)) {
+      expect(milestone).not.toHaveProperty("credits");
+    }
+    for (const reward of Object.values(TASK_REWARDS)) {
+      expect(reward).not.toHaveProperty("credits");
+    }
+    for (const badge of BADGE_DEFINITIONS) {
+      expect(badge).not.toHaveProperty("credits");
+    }
+  });
+
+  it("grants enough at signup to fund at least one campaign", () => {
+    // Otherwise a new account is stuck: it needs credits to be supported, and
+    // credits come from supporting, which needs someone else's campaign to exist.
+    expect(SIGNUP_GRANT_CREDITS).toBeGreaterThanOrEqual(SUPPORT_TRANSFER_CREDITS);
   });
 
   it("penalises a reversal more than a completion earns", () => {

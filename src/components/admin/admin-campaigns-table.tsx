@@ -140,13 +140,12 @@ export function AdminCampaignsTable() {
                   {[
                     { label: "حمایت", value: formatNumber(campaign._count.supports) },
                     { label: "نشست", value: formatNumber(campaign._count.sessions) },
-                    { label: "پاداش", value: formatNumber(campaign.rewardCredits) },
+                    { label: "پاداش هر حمایت", value: formatNumber(campaign.rewardCredits) },
                     {
-                      label: "بودجه",
-                      value:
-                        campaign.budgetCredits === 0
-                          ? "بی‌نهایت"
-                          : `${formatNumber(campaign.spentCredits)}/${formatNumber(campaign.budgetCredits)}`,
+                      // A zero budget is not "unlimited" — the economy has no such
+                      // state, since every payout comes out of escrowed credits.
+                      label: "بودجه (مصرف/کل)",
+                      value: `${formatNumber(campaign.spentCredits)}/${formatNumber(campaign.budgetCredits)}`,
                     },
                   ].map((item) => (
                     <div key={item.label} className="rounded-lg bg-surface-sunken p-2 text-center">

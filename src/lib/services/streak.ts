@@ -1,7 +1,7 @@
 import "server-only";
 import type { Prisma } from "@prisma/client";
 import { REWARDS } from "../gamification";
-import { ledgerKey, recordCredit, recordXp } from "./ledger";
+import { ledgerKey, recordXp } from "./ledger";
 
 /**
  * Daily activity streak.
@@ -10,6 +10,10 @@ import { ledgerKey, recordCredit, recordXp } from "./ledger";
  * by logging in — so the counter measures participation rather than presence.
  * Milestone rewards go through the ledger with a deterministic key, so a user
  * who reaches day 7 twice in one day cannot be paid twice.
+ *
+ * Milestones pay XP ONLY. Credits are a closed transfer economy (see the CREDIT
+ * CONSERVATION note in src/lib/gamification.ts): a streak has no paying
+ * counterparty, so a credit milestone would mint currency from nothing.
  */
 
 type Tx = Prisma.TransactionClient;
@@ -59,13 +63,6 @@ export async function registerStreakDay(tx: Tx, userId: string, now = new Date()
   const milestoneReward = REWARDS.STREAK[streak];
   if (!milestoneReward) return { streak, milestone: null };
 
-  await recordCredit(tx, {
-    userId,
-    type: "CAMPAIGN_BONUS",
-    amount: milestoneReward.credits,
-    idempotencyKey: ledgerKey(["streak-credits", userId, streak, dayKey(now)]),
-    reason: `streak:${streak}`,
-  });
   await recordXp(tx, {
     userId,
     type: "STREAK",

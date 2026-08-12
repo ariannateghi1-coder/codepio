@@ -9,7 +9,7 @@ import { Alert } from "@/components/ui/states";
 import { ProgressBar, Steps, type Step } from "@/components/ui/progress";
 import { Pill, VerificationBadge } from "@/components/ui/badge";
 import { formatDuration, formatNumber } from "@/lib/cn";
-import { WATCH_RULES } from "@/lib/gamification";
+import { SUPPORT_TRANSFER_CREDITS, WATCH_RULES } from "@/lib/gamification";
 
 /**
  * Support session flow — a guided, five-stage experience.
@@ -50,7 +50,7 @@ type SessionInfo = {
   requiredWatchSeconds: number;
   estimatedSeconds: number;
   heartbeatSeconds?: number;
-  tasks: { type: string; required: boolean; rewardCredits: number; rewardXp: number; verifiable: string }[];
+  tasks: { type: string; required: boolean; rewardXp: number; verifiable: string }[];
   youtubeConnected: boolean;
   youtubeState?: string;
 };
@@ -333,15 +333,19 @@ export function SupportFlow({
     onClose();
   }
 
-  /** Live reward preview: the base the campaign will pay for required tasks. */
+  /**
+   * Live reward preview.
+   *
+   * Credits are NOT summed from tasks: a support pays one fixed transfer from the
+   * campaign budget, the same for every campaign, so summing per-task amounts used
+   * to display a number the server would never pay. XP is genuinely per-task and is
+   * summed; the base XP is added by the server at settlement.
+   */
   const liveReward = session
-    ? session.tasks.reduce(
-        (sum, task) => ({
-          credits: sum.credits + task.rewardCredits,
-          xp: sum.xp + task.rewardXp,
-        }),
-        { credits: 0, xp: 0 }
-      )
+    ? {
+        credits: SUPPORT_TRANSFER_CREDITS,
+        xp: session.tasks.reduce((sum, task) => sum + task.rewardXp, 0),
+      }
     : { credits: 0, xp: 0 };
 
   const steps: Step[] = session
@@ -428,7 +432,7 @@ export function SupportFlow({
             <div className="flex items-center justify-between rounded-lg bg-accent-soft px-3 py-2">
               <span className="text-xs font-semibold text-accent">پاداش این حمایت</span>
               <span className="numeric text-sm font-black text-accent">
-                +{formatNumber(liveReward.credits)} اعتبار · +{formatNumber(liveReward.xp)} XP
+                +{formatNumber(liveReward.credits)} اعتبار{liveReward.xp > 0 ? ` · +${formatNumber(liveReward.xp)} XP` : ""}
               </span>
             </div>
 

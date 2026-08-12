@@ -1,13 +1,17 @@
 import type { Prisma } from "@prisma/client";
+import { SUPPORT_TRANSFER_CREDITS } from "../gamification";
 
-export function campaignSettlementCost(input: {
-  rewardCredits: number;
-  tasks?: { required: boolean; rewardCredits: number }[];
-}): number {
-  const optional = (input.tasks ?? [])
-    .filter((task) => !task.required)
-    .reduce((sum, task) => sum + Math.max(0, task.rewardCredits), 0);
-  return Math.max(1, input.rewardCredits + optional);
+/**
+ * What one completed support costs a campaign budget.
+ *
+ * It is the platform transfer constant, full stop — the same amount the supporter
+ * receives. There is deliberately no campaign or task input: when this was a sum
+ * of configurable per-campaign and per-task amounts, two campaigns charged
+ * different prices for the same act, and the cost could drift from the payout.
+ * See the CREDIT CONSERVATION note in src/lib/gamification.ts.
+ */
+export function campaignSettlementCost(): number {
+  return SUPPORT_TRANSFER_CREDITS;
 }
 
 export function campaignAvailabilityWhere(now = new Date()): Prisma.CampaignWhereInput {
@@ -36,18 +40,16 @@ export function effectiveDailySupports(input: {
 export type AvailabilitySnapshot = {
   budgetCredits: number;
   spentCredits: number;
-  rewardCredits: number;
   maxTotalSupports: number | null;
   dailyLimit: number | null;
   totalSupports: number;
   dailySupports: number;
-  tasks?: { required: boolean; rewardCredits: number }[];
 };
 
 export type AvailabilityFailure = "CAMPAIGN_BUDGET_EXHAUSTED" | "CAMPAIGN_FULL" | "DAILY_LIMIT";
 
 export function campaignAvailabilityFailure(input: AvailabilitySnapshot): AvailabilityFailure | null {
-  const cost = campaignSettlementCost(input);
+  const cost = campaignSettlementCost();
   if (input.budgetCredits - input.spentCredits < cost) return "CAMPAIGN_BUDGET_EXHAUSTED";
   if (input.maxTotalSupports !== null && input.totalSupports >= input.maxTotalSupports) return "CAMPAIGN_FULL";
   if (input.dailyLimit !== null && input.dailySupports >= input.dailyLimit) return "DAILY_LIMIT";

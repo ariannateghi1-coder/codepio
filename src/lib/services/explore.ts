@@ -13,6 +13,7 @@ import {
   EXPLORE_POOL,
   NEW_CREATOR_BOOST,
   REPUTATION,
+  SUPPORT_TRANSFER_CREDITS,
   type ExploreLane,
 } from "../gamification";
 
@@ -276,7 +277,7 @@ export async function getExploreFeed(input: {
     include: {
         tasks: {
           orderBy: { sortOrder: "asc" },
-          select: { type: true, required: true, rewardCredits: true },
+          select: { type: true, required: true, rewardXp: true },
         },
         video: { select: { id: true, youtubeVideoId: true, title: true, thumbnailUrl: true, durationSec: true } },
         creator: {
@@ -314,12 +315,10 @@ export async function getExploreFeed(input: {
     campaignAvailabilityFailure({
       budgetCredits: campaign.budgetCredits,
       spentCredits: campaign.spentCredits,
-      rewardCredits: campaign.rewardCredits,
       maxTotalSupports: campaign.maxTotalSupports,
       dailyLimit: campaign.dailyLimit,
       totalSupports: campaign.completedSupports,
       dailySupports: campaign.dailySupports,
-      tasks: campaign.tasks,
     }) === null
   );
 
@@ -400,7 +399,9 @@ export async function getExploreFeed(input: {
         title: campaign.title || video.title,
         thumbnailUrl: video.thumbnailUrl,
         durationSec: video.durationSec,
-        reward: { credits: campaign.rewardCredits, xp: campaign.rewardXp },
+        // credits is the platform transfer constant, identical on every card. It is
+        // still returned so the card can state the amount without importing config.
+        reward: { credits: SUPPORT_TRANSFER_CREDITS, xp: campaign.rewardXp },
         requiredWatchPercent: campaign.requiredWatchPercent,
         estimatedSeconds: requiredSec + 60,
         tasks: campaign.tasks.length
@@ -482,12 +483,12 @@ function assignLane(input: {
 
 type Scored = {
   card: ExploreCard & { id: string };
-  campaign: { endAt: Date; createdAt: Date; rewardCredits: number };
+  campaign: { endAt: Date; createdAt: Date; rewardXp: number };
   creator: { reputation: number; trustScore: number };
 };
 
 function applyFilter(
-  items: { card: ExploreCard; campaign: { endAt: Date; createdAt: Date; rewardCredits: number }; creator: { reputation: number; trustScore: number } }[],
+  items: { card: ExploreCard; campaign: { endAt: Date; createdAt: Date; rewardXp: number }; creator: { reputation: number; trustScore: number } }[],
   filter: ExploreFilter
 ): Scored[] {
   // `id` mirrors campaignId so the cursor comparison has one field name to use.
@@ -511,7 +512,10 @@ function applyFilter(
     case "top_creators":
       return withId.sort((a, b) => b.creator.reputation - a.creator.reputation || byScoreThenId(a, b));
     case "highest_reward":
-      return withId.sort((a, b) => b.campaign.rewardCredits - a.campaign.rewardCredits || byScoreThenId(a, b));
+      // Sorts on XP, not credits: the credit per support is a platform constant, so
+      // ranking by it would order every campaign identically and the filter would
+      // silently do nothing. XP is genuinely campaign-configurable.
+      return withId.sort((a, b) => b.campaign.rewardXp - a.campaign.rewardXp || byScoreThenId(a, b));
     case "ending_soon":
       return withId.sort((a, b) => a.campaign.endAt.getTime() - b.campaign.endAt.getTime() || byScoreThenId(a, b));
     case "most_trusted":

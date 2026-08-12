@@ -12,7 +12,6 @@ export const GET = publicRoute(
         name: true,
         description: true,
         icon: true,
-        rewardCredits: true,
         rewardXp: true,
         _count: { select: { users: true } },
       },

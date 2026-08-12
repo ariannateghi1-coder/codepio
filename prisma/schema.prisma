@@ -131,6 +131,12 @@ enum CreditEntryType {
   CAMPAIGN_BUDGET_SPEND
   REVERSAL
   PENALTY
+  /// One-time signup grant: the only place credits enter the system.
+  /// Added by migration 20260814000000, so it is LAST in Postgres enum order.
+  /// SUPPORT_RECEIVED / MUTUAL_BONUS / CAMPAIGN_BONUS / REFERRAL / BADGE_REWARD
+  /// are retained for historical rows only; nothing writes them any more, because
+  /// they minted credits with no paying counterparty.
+  SIGNUP_GRANT
 }
 
 enum XpEntryType {

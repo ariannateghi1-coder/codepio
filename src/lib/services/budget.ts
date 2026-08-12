@@ -1,24 +1,24 @@
 import "server-only";
 import { Prisma } from "@prisma/client";
 import { prisma } from "../prisma";
-import { NotFoundError } from "../errors";
+import { BusinessRuleError, NotFoundError } from "../errors";
 import { ledgerKey, recordCredit } from "./ledger";
 import { logger } from "../logger";
 import { campaignSettlementCost } from "./campaign-eligibility";
 
 /**
- * Campaign budget funding — the credit SINK that closes the product loop.
+ * Campaign budget funding — the PAYING HALF of the credit transfer.
  *
- * Without this the economy is open-ended: supporters earn credits and nothing ever
- * consumes them, so the balance only grows and a credit means progressively less.
- * The loop the product actually promises is:
+ * Credits are a closed, zero-sum economy (see the CREDIT CONSERVATION note in
+ * src/lib/gamification.ts). A support does not mint a reward; it moves a fixed
+ * amount from a creator's funded budget to a supporter:
  *
- *   support others → earn credits → SPEND credits on exposure → receive support
+ *   creator balance → campaign budget → supporter balance
  *
- * So a campaign's reward budget is paid for out of the creator's own credits, at
- * the moment the budget is set. That makes exposure cost something, gives credits
- * a real use, and ties the amount of support a creator can attract to the amount
- * they have given.
+ * A budget is therefore an escrow, not a fee: the creator's credits leave their
+ * balance when the budget is funded, sit in the campaign, and are handed to
+ * supporters one transfer at a time as supports complete. Anything unspent comes
+ * back when the campaign ends. Nothing evaporates and nothing appears.
  *
  * Rules encoded here:
  *  • Funding a budget DEBITS the creator through the ledger (CAMPAIGN_BUDGET_SPEND).
@@ -26,7 +26,8 @@ import { campaignSettlementCost } from "./campaign-eligibility";
  *  • The debit and the campaign write happen in one transaction, so a campaign can
  *    never exist with an unfunded budget, and credits can never be taken without a
  *    campaign to show for it.
- *  • Raising a budget debits only the delta.
+ *  • Raising a budget debits only the delta, and the debit must have actually been
+ *    applied before the new budget is written — see assertApplied.
  *  • Lowering is refused below what is already spent (the remaining budget would
  *    read negative).
  *  • Ending a campaign REFUNDS the unspent remainder. A creator who over-funded is
@@ -37,21 +38,47 @@ import { campaignSettlementCost } from "./campaign-eligibility";
 
 type Tx = Prisma.TransactionClient;
 
-/** Reserves credits from the creator for a campaign budget. Throws if short. */
+/**
+ * Moves credits from the creator's balance into a campaign budget. Throws if the
+ * creator is short.
+ *
+ * `idempotencyKey` must identify this specific funding event. It is a required
+ * parameter rather than something derived from `amount`, because a key built from
+ * the amount alone repeats: fund 100 → raise to 150 (delta 50) → lower to 100 →
+ * raise to 150 again produces the same "delta 50" key twice, the ledger treats the
+ * second one as an already-applied replay, and the budget would rise without the
+ * creator being charged. The caller therefore keys on the transition, not the size.
+ */
 export async function debitBudget(
   tx: Tx,
-  input: { creatorId: string; campaignId: string; amount: number; note: string }
+  input: { creatorId: string; campaignId: string; amount: number; note: string; idempotencyKey: string }
 ): Promise<void> {
   if (input.amount <= 0) return;
 
-  await recordCredit(tx, {
+  const result = await recordCredit(tx, {
     userId: input.creatorId,
     type: "CAMPAIGN_BUDGET_SPEND",
     amount: -input.amount,
-    idempotencyKey: ledgerKey(["campaign-budget", input.campaignId, input.amount, input.note]),
+    idempotencyKey: input.idempotencyKey,
     campaignId: input.campaignId,
     reason: input.note,
   });
+
+  // recordCredit returns applied:false for a replayed key. For a debit that means
+  // "the money was NOT taken this time", so the caller must not proceed to grant
+  // the budget it pays for. Failing loudly is the only safe reading: silently
+  // treating it as success is how an unfunded budget appears.
+  assertApplied(result, input.campaignId);
+}
+
+/** Guard for the invariant "budget granted ⇒ credits actually debited". */
+function assertApplied(result: { applied: boolean }, campaignId: string): void {
+  if (result.applied) return;
+  logger.error("campaign budget debit was a replay; refusing to grant budget", { campaignId });
+  throw new BusinessRuleError(
+    "این تغییر بودجه قبلاً ثبت شده است. صفحه را تازه کنید و در صورت نیاز دوباره تلاش کنید.",
+    { rule: "BUDGET_DEBIT_REPLAYED" }
+  );
 }
 
 /** Returns unspent budget to the creator. Used when a campaign ends. */
@@ -117,17 +144,14 @@ export async function endCampaignWithRefund(input: { campaignId: string; creator
 }
 
 /**
- * How much exposure a given budget buys, for the studio UI.
+ * How many supports a given budget can still pay for, for the studio UI.
  * Purely informational: the authoritative accounting is the atomic conditional
- * UPDATE in the completion path.
+ * UPDATE in the completion path. Every support costs the same fixed transfer, so
+ * this is a plain division with no campaign-specific pricing.
  */
-export function estimateSupports(
-  budgetCredits: number,
-  rewardCredits: number,
-  tasks: { required: boolean; rewardCredits: number }[] = []
-): number | null {
-  if (budgetCredits <= 0) return null;
-  const settlementCost = campaignSettlementCost({ rewardCredits, tasks });
+export function estimateSupports(remainingBudgetCredits: number): number | null {
+  if (remainingBudgetCredits <= 0) return null;
+  const settlementCost = campaignSettlementCost();
   if (settlementCost <= 0) return null;
-  return Math.floor(budgetCredits / settlementCost);
+  return Math.floor(remainingBudgetCredits / settlementCost);
 }

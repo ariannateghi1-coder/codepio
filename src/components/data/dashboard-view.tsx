@@ -53,8 +53,11 @@ type Dashboard = {
   };
   wallet: {
     balance: number;
+    granted: number;
     earned: number;
     spentOnExposure: number;
+    /** Credits currently reserved in the user's own running campaigns. */
+    escrowed: number;
     reversed: number;
     adjustments: number;
     pending: number;
@@ -195,7 +198,7 @@ export function DashboardView() {
           real ledger entries, not a derived guess. */}
       <Section
         title="کیف اعتبار"
-        description="اعتبار با حمایت واقعی به‌دست می‌آید و با تعیین بودجه کمپین برای دیده‌شدن خرج می‌شود."
+        description="اعتبار بین کاربران جابه‌جا می‌شود: بودجه کمپین شما به حامیان پرداخت می‌شود و حمایت شما از دیگران، اعتبار آن‌ها را به شما می‌رساند. مقدار هر حمایت برای همه یکسان و ثابت است."
         actions={
           <Link href="/support/history" className="text-sm font-bold text-accent">
             تاریخچه
@@ -217,10 +220,14 @@ export function DashboardView() {
 
           <dl className="mt-5 grid grid-cols-2 gap-2 sm:grid-cols-4">
             {[
-              { label: "کسب‌شده", value: data.wallet.earned, tone: "text-success" },
-              { label: "خرج‌شده برای دیده‌شدن", value: data.wallet.spentOnExposure, tone: "text-fg" },
+              { label: "هدیه ثبت‌نام", value: data.wallet.granted, tone: "text-fg" },
+              { label: "کسب‌شده از حمایت", value: data.wallet.earned, tone: "text-success" },
+              {
+                label: "در بودجه کمپین",
+                value: data.wallet.escrowed,
+                tone: data.wallet.escrowed > 0 ? "text-accent" : "text-fg-subtle",
+              },
               { label: "برگشت‌خورده", value: data.wallet.reversed, tone: data.wallet.reversed > 0 ? "text-warning" : "text-fg-subtle" },
-              { label: "در انتظار تأیید", value: data.wallet.pending, tone: data.wallet.pending > 0 ? "text-warning" : "text-fg-subtle" },
             ].map((item) => (
               <div key={item.label} className="rounded-lg bg-surface-sunken p-3">
                 <dt className="text-[0.6875rem] leading-5 text-fg-subtle">{item.label}</dt>

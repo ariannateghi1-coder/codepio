@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { extractYoutubeVideoId, isValidYoutubeChannelId } from "./youtube";
-import { WATCH_RULES } from "./gamification";
+import { SUPPORT_TRANSFER_CREDITS, WATCH_RULES } from "./gamification";
 
 /**
  * Validation layer.
@@ -151,9 +151,21 @@ export const campaignCreateSchema = z
       .min(WATCH_RULES.minRequiredPercent)
       .max(WATCH_RULES.maxRequiredPercent)
       .default(WATCH_RULES.defaultRequiredPercent),
-    rewardCredits: z.coerce.number().int().min(1).max(200).default(10),
+    /**
+     * NOTE: there is deliberately NO rewardCredits field. The credit a supporter
+     * receives is the platform constant SUPPORT_TRANSFER_CREDITS, and it is the
+     * same amount the creator's budget is charged. Accepting it from the client
+     * would let one campaign pay more than another for identical work, and would
+     * let the payout drift from the charge. XP stays configurable: it is
+     * progression, not currency.
+     */
     rewardXp: z.coerce.number().int().min(1).max(500).default(25),
-    budgetCredits: z.coerce.number().int().min(1).max(1_000_000),
+    /** Escrowed up front; must cover at least one full transfer. */
+    budgetCredits: z.coerce
+      .number()
+      .int()
+      .min(SUPPORT_TRANSFER_CREDITS, `بودجه باید حداقل ${SUPPORT_TRANSFER_CREDITS} اعتبار باشد.`)
+      .max(1_000_000),
     maxTotalSupports: z.coerce.number().int().min(1).max(100_000).optional().nullable(),
     maxSupportsPerUser: z.coerce.number().int().min(1).max(100).optional().nullable(),
     dailyLimit: z.coerce.number().int().min(1).max(10_000).optional().nullable(),
@@ -164,18 +176,16 @@ export const campaignCreateSchema = z
           type: taskTypeSchema,
           required: z.boolean().default(true),
           /**
-           * Optional-task bonus. Required tasks must be 0: their value is already
-           * inside the campaign's own rewardCredits/rewardXp. Allowing both would
-           * create two parallel reward models and, with them, double counting —
-           * see src/lib/services/reward.ts for the canonical model.
+           * Optional-task bonus — XP ONLY. There is no per-task credit field:
+           * per-task credits are how a supporter ends up paid more than the budget
+           * was charged. Required tasks must be 0; their value is in the base.
            */
-          rewardCredits: z.coerce.number().int().min(0).max(50).default(0),
           rewardXp: z.coerce.number().int().min(0).max(100).default(0),
         })
       )
       .min(1, "حداقل یک کار لازم است.")
       .max(4)
-      .default([{ type: "WATCH_VIDEO", required: true, rewardCredits: 0, rewardXp: 0 }]),
+      .default([{ type: "WATCH_VIDEO", required: true, rewardXp: 0 }]),
   })
   .refine((v) => v.endAt.getTime() > v.startAt.getTime(), { path: ["endAt"], message: "پایان کمپین باید بعد از شروع باشد." })
   .refine((v) => v.endAt.getTime() - v.startAt.getTime() <= 365 * 86_400_000, {
@@ -190,21 +200,10 @@ export const campaignCreateSchema = z
     path: ["tasks"],
     message: "کارهای تکراری مجاز نیست.",
   })
-  .refine((v) => v.tasks.every((t) => !t.required || (t.rewardCredits === 0 && t.rewardXp === 0)), {
+  .refine((v) => v.tasks.every((t) => !t.required || t.rewardXp === 0), {
     path: ["tasks"],
     message: "پاداش کارهای الزامی داخل پاداش پایه کمپین است و نباید جداگانه تعیین شود.",
-  })
-  .refine(
-    (v) => {
-      // The budget must be able to pay at least one full settlement, otherwise the
-      // campaign would appear in Explore and then refuse every completion.
-      const optionalBonus = v.tasks
-        .filter((t) => !t.required)
-        .reduce((sum, t) => sum + t.rewardCredits, 0);
-      return v.budgetCredits >= v.rewardCredits + optionalBonus;
-    },
-    { path: ["budgetCredits"], message: "بودجه باید حداقل برای یک حمایت کامل کافی باشد." }
-  );
+  });
 
 export const campaignUpdateSchema = z
   .object({
@@ -214,7 +213,12 @@ export const campaignUpdateSchema = z
     description: cleanText(1000).optional().nullable(),
     endAt: z.coerce.date().optional(),
     dailyLimit: z.coerce.number().int().min(1).max(10_000).optional().nullable(),
-    budgetCredits: z.coerce.number().int().min(1).max(1_000_000).optional(),
+    budgetCredits: z.coerce
+      .number()
+      .int()
+      .min(SUPPORT_TRANSFER_CREDITS, `بودجه باید حداقل ${SUPPORT_TRANSFER_CREDITS} اعتبار باشد.`)
+      .max(1_000_000)
+      .optional(),
   })
   .superRefine((value, ctx) => {
     const editFields = ["title", "description", "endAt", "dailyLimit", "budgetCredits"] as const;

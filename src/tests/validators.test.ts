@@ -161,13 +161,17 @@ describe("campaignCreateSchema", () => {
     title: "کمپین تست",
     startAt: new Date().toISOString(),
     endAt: new Date(Date.now() + 86_400_000).toISOString(),
+    // Required by the schema (a campaign must be funded), so it belongs in the
+    // fixture — without it every parse here fails on budgetCredits instead of
+    // exercising the field under test.
+    budgetCredits: 100,
     tasks: [{ type: "WATCH_VIDEO", required: true }],
   };
 
   it("accepts a minimal valid campaign and applies defaults", () => {
     const parsed = campaignCreateSchema.parse(base);
     expect(parsed.requiredWatchPercent).toBe(90);
-    expect(parsed.rewardCredits).toBe(10);
+    expect(parsed.rewardXp).toBe(25);
   });
 
   it("requires the end date after the start date", () => {
@@ -198,11 +202,11 @@ describe("campaignCreateSchema", () => {
     ).toBe(false);
   });
 
-  it("bounds the watch percentage and the reward", () => {
+  it("bounds the watch percentage and the XP reward", () => {
     expect(ok(campaignCreateSchema, { ...base, requiredWatchPercent: 10 })).toBe(false);
     expect(ok(campaignCreateSchema, { ...base, requiredWatchPercent: 150 })).toBe(false);
-    expect(ok(campaignCreateSchema, { ...base, rewardCredits: 0 })).toBe(false);
-    expect(ok(campaignCreateSchema, { ...base, rewardCredits: 9999 })).toBe(false);
+    expect(ok(campaignCreateSchema, { ...base, rewardXp: 0 })).toBe(false);
+    expect(ok(campaignCreateSchema, { ...base, rewardXp: 9999 })).toBe(false);
   });
 });
 

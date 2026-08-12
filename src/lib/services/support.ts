@@ -165,12 +165,10 @@ async function assertEligible(tx: Tx, input: EligibilityInput) {
   const availabilityFailure = campaignAvailabilityFailure({
     budgetCredits: campaign.budgetCredits,
     spentCredits: campaign.spentCredits,
-    rewardCredits: campaign.rewardCredits,
     maxTotalSupports: campaign.maxTotalSupports,
     dailyLimit: campaign.dailyLimit,
     totalSupports,
     dailySupports,
-    tasks: campaign.tasks,
   });
   if (availabilityFailure) throw ruleError(availabilityFailure);
 
@@ -192,7 +190,7 @@ export type StartSupportResult = {
   session: SupportSession;
   video: { id: string; youtubeVideoId: string; durationSec: number | null };
   requiredWatchSeconds: number;
-  tasks: { type: string; required: boolean; rewardCredits: number; rewardXp: number }[];
+  tasks: { type: string; required: boolean; rewardXp: number }[];
   estimatedSeconds: number;
 };
 
@@ -226,7 +224,7 @@ export async function startSupportSession(input: StartSupportInput): Promise<Sta
             type: "WATCH_VIDEO" as const,
             required: true,
             config: null,
-            rewardCredits: TASK_REWARDS.WATCH_VIDEO.credits,
+            rewardCredits: 0,
             rewardXp: TASK_REWARDS.WATCH_VIDEO.xp,
             timeoutSec: WATCH_RULES.sessionTtlMinutes * 60,
             sortOrder: 0,
@@ -273,10 +271,11 @@ export async function startSupportSession(input: StartSupportInput): Promise<Sta
       session,
       video: { id: video.id, youtubeVideoId: video.youtubeVideoId, durationSec: video.durationSec },
       requiredWatchSeconds: requiredSec,
+      // Credits are not per-task: the support pays one fixed transfer, so the
+      // client is told the XP bonus per task and the transfer separately.
       tasks: tasks.map((task) => ({
         type: task.type,
         required: task.required,
-        rewardCredits: task.rewardCredits,
         rewardXp: task.rewardXp,
       })),
       estimatedSeconds: requiredSec + 60,
@@ -845,12 +844,14 @@ async function runCompletion(input: { sessionId: string; supporterId: string }) 
       // for why two parallel reward models were collapsed into one.
       const campaignTaskConfig = await tx.campaignTask.findMany({
         where: { campaignId: campaign.id },
-        select: { type: true, required: true, rewardCredits: true, rewardXp: true },
+        select: { type: true, required: true, rewardXp: true },
       });
       const configByType = new Map(campaignTaskConfig.map((task) => [task.type, task]));
 
+      // The credit leg is NOT passed in: it is the platform transfer constant, so
+      // no campaign field can make one support pay more or cost less than another.
+      // Only XP is campaign-configurable here.
       const settlement = computeSettlement({
-        baseCredits: campaign.rewardCredits || REWARDS.SUPPORT_COMPLETED.credits,
         baseXp: campaign.rewardXp || REWARDS.SUPPORT_COMPLETED.xp,
         tasks: session.tasks.map((task) => {
           const config = configByType.get(task.type);
@@ -859,7 +860,6 @@ async function runCompletion(input: { sessionId: string; supporterId: string }) 
             type: task.type,
             required: task.required,
             satisfied: task.state === "SATISFIED",
-            rewardCredits: config?.rewardCredits || fallback.credits,
             rewardXp: config?.rewardXp || fallback.xp,
           };
         }),
@@ -968,16 +968,23 @@ async function runCompletion(input: { sessionId: string; supporterId: string }) 
         // One ledger entry per settlement component, each with its own
         // idempotency key — so a retry can never pay a component twice, and a
         // reversal can undo them individually.
+        //
+        // THE ONLY CREDIT MOVEMENT in this settlement. It is the receiving half of
+        // a transfer whose paying half is the campaign budget: `spentCredits` was
+        // incremented by exactly settlement.budgetCost in the conditional UPDATE
+        // above, and budgetCost === transferCredits === this amount. The credits
+        // themselves left the creator's balance when the budget was funded
+        // (services/budget.ts), so nothing is minted here and nothing is burned.
         await recordCredit(tx, {
           userId: input.supporterId,
           type: "SUPPORT_COMPLETED",
-          amount: settlement.base.credits,
+          amount: settlement.transferCredits,
           idempotencyKey: ledgerKey(["support-credits", session.id]),
           sessionId: session.id,
           campaignId: campaign.id,
           supportId: support.id,
-          reason: multiplier < 1 ? `diminished x${multiplier}` : undefined,
-          metadata: { multiplier, priorPairSupports },
+          reason: "support transfer from campaign budget",
+          metadata: { transferCredits: settlement.transferCredits, xpMultiplier: multiplier, priorPairSupports },
         });
         const xpResult = await recordXp(tx, {
           userId: input.supporterId,
@@ -988,22 +995,14 @@ async function runCompletion(input: { sessionId: string; supporterId: string }) 
           supportId: support.id,
         });
         levelAfter = xpResult.level;
-        creditsPaid += settlement.base.credits;
+        creditsPaid += settlement.transferCredits;
         xpPaid += settlement.base.xp;
 
-        // Optional-task bonuses. Keyed by task type, so adding a second optional
-        // task later cannot collide with an existing entry.
+        // Optional-task bonuses — XP ONLY. Keyed by task type, so adding a second
+        // optional task later cannot collide with an existing entry. Paying credits
+        // here would mint them: the budget was charged the transfer amount and
+        // nothing more, so there is no funded source for a credit bonus.
         for (const bonus of settlement.taskBonuses) {
-          await recordCredit(tx, {
-            userId: input.supporterId,
-            type: "CAMPAIGN_BONUS",
-            amount: bonus.credits,
-            idempotencyKey: ledgerKey(["task-credits", session.id, bonus.key]),
-            sessionId: session.id,
-            campaignId: campaign.id,
-            supportId: support.id,
-            reason: bonus.label,
-          });
           const bonusXp = await recordXp(tx, {
             userId: input.supporterId,
             type: "SUPPORT_COMPLETED",
@@ -1013,19 +1012,11 @@ async function runCompletion(input: { sessionId: string; supporterId: string }) 
             supportId: support.id,
           });
           if (bonusXp.applied) levelAfter = bonusXp.level;
-          creditsPaid += bonus.credits;
           xpPaid += bonus.xp;
         }
 
+        // Mutual-exchange bonus — XP ONLY, for the same reason as task bonuses.
         if (settlement.mutualBonus) {
-          await recordCredit(tx, {
-            userId: input.supporterId,
-            type: "MUTUAL_BONUS",
-            amount: settlement.mutualBonus.credits,
-            idempotencyKey: ledgerKey(["mutual-credits", session.id]),
-            sessionId: session.id,
-            supportId: support.id,
-          });
           const mutualXpResult = await recordXp(tx, {
             userId: input.supporterId,
             type: "MUTUAL_BONUS",
@@ -1035,20 +1026,13 @@ async function runCompletion(input: { sessionId: string; supporterId: string }) 
             supportId: support.id,
           });
           if (mutualXpResult.applied) levelAfter = mutualXpResult.level;
-          creditsPaid += settlement.mutualBonus.credits;
           xpPaid += settlement.mutualBonus.xp;
         }
 
-        // Creator side. Platform-funded, so it does not draw on the campaign
-        // budget the creator themselves paid for.
-        await recordCredit(tx, {
-          userId: session.creatorId,
-          type: "SUPPORT_RECEIVED",
-          amount: settlement.creatorCredits,
-          idempotencyKey: ledgerKey(["received-credits", session.id]),
-          sessionId: session.id,
-          supportId: support.id,
-        });
+        // Creator side — XP ONLY, never credits. The creator's return on a support
+        // is the support itself (exposure, watch time, a subscriber); crediting
+        // them as well would create currency with no matching debit, which is how
+        // total credits previously grew without bound.
         await recordXp(tx, {
           userId: session.creatorId,
           type: "SUPPORT_RECEIVED",
@@ -1166,9 +1150,9 @@ async function runCompletion(input: { sessionId: string; supporterId: string }) 
 }
 
 /**
- * Pays the referral bonus once the referred user has completed a real support —
- * not at signup, which is what made throwaway-account farming profitable.
- * `creditedAt` + a conditional updateMany make the payout idempotent.
+ * Pays the referral bonus (XP) once the referred user has completed a real
+ * support — not at signup, which is what made throwaway-account farming
+ * profitable. `creditedAt` + a conditional updateMany make the payout idempotent.
  */
 async function creditReferralIfEligible(tx: Tx, referredUserId: string, sessionId: string) {
   const referral = await tx.referral.findUnique({ where: { referredId: referredUserId } });
@@ -1184,14 +1168,9 @@ async function creditReferralIfEligible(tx: Tx, referredUserId: string, sessionI
   const referrer = await tx.user.findUnique({ where: { id: referral.referrerId }, select: { status: true } });
   if (!referrer || referrer.status !== "ACTIVE") return;
 
-  await recordCredit(tx, {
-    userId: referral.referrerId,
-    type: "REFERRAL",
-    amount: REWARDS.REFERRAL.credits,
-    idempotencyKey: ledgerKey(["referral-credits", referral.id]),
-    sessionId,
-    reason: "referral first verified support",
-  });
+  // XP ONLY. A credit referral bonus has no funding source, so it would mint
+  // currency — and an invite-driven credit faucet is exactly what makes
+  // throwaway-account farming profitable.
   await recordXp(tx, {
     userId: referral.referrerId,
     type: "REFERRAL",
@@ -1203,7 +1182,7 @@ async function creditReferralIfEligible(tx: Tx, referredUserId: string, sessionI
     userId: referral.referrerId,
     type: "SYSTEM",
     title: "پاداش دعوت دریافت شد 🎁",
-    message: `کاربری که با کد دعوت شما ثبت‌نام کرد اولین حمایت تأییدشده‌اش را کامل کرد و ${REWARDS.REFERRAL.credits} اعتبار به شما اضافه شد.`,
+    message: `کاربری که با کد دعوت شما ثبت‌نام کرد اولین حمایت تأییدشده‌اش را کامل کرد و ${REWARDS.REFERRAL.xp} XP به شما اضافه شد.`,
     metadata: { referralId: referral.id },
     dedupeKey: ledgerKey(["referral-notification", referral.id]),
   });

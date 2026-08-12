@@ -1,0 +1,11 @@
+-- Adds SIGNUP_GRANT, the single credit source in the system.
+--
+-- Credits are otherwise a closed transfer economy: a support moves a fixed amount
+-- from a campaign's escrowed budget to the supporter, and nothing mints or burns.
+-- A brand-new account therefore has no way to fund a first campaign, which is the
+-- entry point the loop needs. That grant is recorded in the ledger like every
+-- other movement rather than as an invisible starting balance.
+--
+-- ADD VALUE (not a type rewrite) keeps existing enum history intact, so this
+-- migration is safe to apply to a database that already holds CreditLedger rows.
+ALTER TYPE "CreditEntryType" ADD VALUE IF NOT EXISTS 'SIGNUP_GRANT';

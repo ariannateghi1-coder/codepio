@@ -34,7 +34,8 @@ type Member = {
 };
 
 const SORTS = [
-  { value: "reputation", label: "اعتبار" },
+  // "اعتبار کیفی" not "اعتبار": this sorts on reputation, not the credit balance.
+  { value: "reputation", label: "اعتبار کیفی" },
   { value: "supports", label: "فعال‌ترین" },
   { value: "recent", label: "تازه‌واردها" },
 ] as const;

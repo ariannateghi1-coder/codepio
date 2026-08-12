@@ -13,6 +13,7 @@ import { Alert, EmptyState, ErrorState } from "@/components/ui/states";
 import { Section } from "@/components/layout/page";
 import { useToast } from "@/components/ui/toast";
 import { formatDuration, formatNumber, formatRelativeTime } from "@/lib/cn";
+import { SUPPORT_TRANSFER_CREDITS } from "@/lib/gamification";
 
 /**
  * Creator studio: videos and campaigns.
@@ -45,7 +46,15 @@ type Campaign = {
   requiredWatchPercent: number;
   video: { title: string; thumbnailUrl: string | null; durationSec: number | null } | null;
   tasks: { type: string; required: boolean }[];
-  analytics: { started: number; completed: number; failed: number; completionRate: number | null; budgetRemaining: number | null };
+  analytics: {
+    started: number;
+    completed: number;
+    failed: number;
+    completionRate: number | null;
+    budgetRemaining: number | null;
+    /** How many more supports the remaining escrow can pay for. */
+    supportsRemaining: number | null;
+  };
 };
 
 const TASK_LABELS: Record<string, string> = {
@@ -256,11 +265,14 @@ export function StudioView() {
                         value: campaign.analytics.completionRate === null ? "—" : `${formatNumber(campaign.analytics.completionRate)}٪`,
                       },
                       {
-                        label: "بودجه باقی‌مانده",
+                        // "بی‌نهایت" was wrong: a campaign cannot exist with a zero
+                        // budget, so the null branch is unreachable in practice and
+                        // an unbounded budget is not a state the economy allows.
+                        label: "حمایت باقی‌مانده",
                         value:
-                          campaign.analytics.budgetRemaining === null
-                            ? "بی‌نهایت"
-                            : formatNumber(campaign.analytics.budgetRemaining),
+                          campaign.analytics.supportsRemaining === null
+                            ? "—"
+                            : formatNumber(campaign.analytics.supportsRemaining),
                       },
                     ].map((item) => (
                       <div key={item.label} className="rounded-lg bg-surface-sunken p-2.5 text-center">
@@ -367,24 +379,23 @@ function CreateCampaignModal({
   const [requireSubscribe, setRequireSubscribe] = useState(true);
   const [requireLike, setRequireLike] = useState(true);
   const [askComment, setAskComment] = useState(false);
-  const [commentBonus, setCommentBonus] = useState(2);
+  const [commentBonusXp, setCommentBonusXp] = useState(5);
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!videoId) return;
     const form = new FormData(event.currentTarget);
 
-    // Canonical reward model (see src/lib/services/reward.ts): the campaign's own
-    // rewardCredits covers ALL required tasks, so required tasks carry no reward of
-    // their own — the API rejects it if they do. Only an optional task may add a
-    // bonus, which is why the comment task is the only one with a reward here.
+    // Task bonuses are XP ONLY (see src/lib/services/reward.ts). The credit a
+    // supporter receives is the fixed campaign transfer, so a per-task credit would
+    // pay out more than the budget was charged. Required tasks carry no bonus at
+    // all — their value is in the base — which is why only the optional comment
+    // task has one.
     const tasks = [
-      { type: "WATCH_VIDEO" as const, required: true, rewardCredits: 0, rewardXp: 0 },
-      ...(requireSubscribe ? [{ type: "SUBSCRIBE_CHANNEL" as const, required: true, rewardCredits: 0, rewardXp: 0 }] : []),
-      ...(requireLike ? [{ type: "LIKE_VIDEO" as const, required: true, rewardCredits: 0, rewardXp: 0 }] : []),
-      ...(askComment
-        ? [{ type: "COMMENT_VIDEO" as const, required: false, rewardCredits: commentBonus, rewardXp: commentBonus * 2 }]
-        : []),
+      { type: "WATCH_VIDEO" as const, required: true, rewardXp: 0 },
+      ...(requireSubscribe ? [{ type: "SUBSCRIBE_CHANNEL" as const, required: true, rewardXp: 0 }] : []),
+      ...(requireLike ? [{ type: "LIKE_VIDEO" as const, required: true, rewardXp: 0 }] : []),
+      ...(askComment ? [{ type: "COMMENT_VIDEO" as const, required: false, rewardXp: commentBonusXp }] : []),
     ];
 
     setLoading(true);
@@ -398,7 +409,8 @@ function CreateCampaignModal({
         startAt: new Date().toISOString(),
         endAt: new Date(Date.now() + Number(form.get("days") ?? 30) * 86_400_000).toISOString(),
         requiredWatchPercent: Number(form.get("requiredWatchPercent") ?? 90),
-        rewardCredits: Number(form.get("rewardCredits") ?? 10),
+        // No rewardCredits: the per-support credit amount is a platform constant,
+        // identical for every campaign, and the API rejects the field.
         rewardXp: 25,
         budgetCredits: Number(form.get("budgetCredits")),
         maxSupportsPerUser: 1,
@@ -445,15 +457,13 @@ function CreateCampaignModal({
             </Select>
           </Field>
 
-          <Field label="پاداش هر حمایت (اعتبار)" htmlFor="rewardCredits" error={fields.rewardCredits}>
-            <Input id="rewardCredits" name="rewardCredits" type="number" min={1} max={200} defaultValue={10} dir="ltr" className="latin" />
-          </Field>
-
           <Field
             label="بودجه کل (اعتبار)"
             htmlFor="budgetCredits"
             required
-            hint="بودجه هنگام ساخت کمپین از موجودی اعتبار شما کسر می‌شود."
+            hint={`بودجه هنگام ساخت کمپین از موجودی شما کسر و در کمپین نگه داشته می‌شود. هر حمایت ${formatNumber(
+              SUPPORT_TRANSFER_CREDITS
+            )} اعتبار از آن به حامی پرداخت می‌شود؛ باقی‌مانده با پایان کمپین به شما برمی‌گردد.`}
             error={fields.budgetCredits}
           >
             <Input
@@ -491,22 +501,26 @@ function CreateCampaignModal({
         <div className="space-y-3 rounded-lg border border-border p-3">
           <p className="text-sm font-bold">کارهای مورد نیاز</p>
           <p className="text-xs leading-6 text-fg-subtle">
-            تماشا همیشه الزامی است. سابسکرایب و لایک فقط برای حامیانی قابل تأیید است که حساب یوتیوب خود را متصل کرده‌اند. پاداش کارهای الزامی
-            داخل «پاداش هر حمایت» است؛ فقط کار اختیاری پاداش جداگانه می‌گیرد.
+            تماشا همیشه الزامی است. سابسکرایب و لایک فقط برای حامیانی قابل تأیید است که حساب یوتیوب خود را متصل کرده‌اند. اعتبار هر حمایت
+            برای همه کمپین‌ها یکسان و ثابت است؛ کار اختیاری فقط XP اضافه می‌کند.
           </p>
           <Switch checked={requireSubscribe} onChange={setRequireSubscribe} label="سابسکرایب کانال" description="با API رسمی یوتیوب بررسی می‌شود." />
           <Switch checked={requireLike} onChange={setRequireLike} label="لایک ویدیو" description="با API رسمی یوتیوب بررسی می‌شود." />
           <Switch checked={askComment} onChange={setAskComment} label="کامنت (اختیاری)" description="عدم انجام آن مانع تکمیل حمایت نمی‌شود." />
 
           {askComment && (
-            <Field label="پاداش اضافی کامنت (اعتبار)" htmlFor="commentBonus" hint="فقط در صورت انجام و تأیید پرداخت می‌شود.">
+            <Field
+              label="پاداش اضافی کامنت (XP)"
+              htmlFor="commentBonusXp"
+              hint="فقط در صورت انجام و تأیید پرداخت می‌شود. این پاداش XP است، نه اعتبار — اعتبار هر حمایت ثابت است."
+            >
               <Input
-                id="commentBonus"
+                id="commentBonusXp"
                 type="number"
                 min={0}
-                max={50}
-                value={commentBonus}
-                onChange={(event) => setCommentBonus(Math.max(0, Math.min(50, Number(event.target.value) || 0)))}
+                max={100}
+                value={commentBonusXp}
+                onChange={(event) => setCommentBonusXp(Math.max(0, Math.min(100, Number(event.target.value) || 0)))}
                 dir="ltr"
                 className="latin"
               />

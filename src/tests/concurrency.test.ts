@@ -3,6 +3,7 @@ import { PrismaClient } from "@prisma/client";
 import { completeSupportSession, recordWatchHeartbeat, startSupportSession } from "@/lib/services/support";
 import { auditUserBalances } from "@/lib/services/ledger";
 import { hashPassword, referralCode } from "@/lib/security";
+import { SUPPORT_TRANSFER_CREDITS } from "@/lib/gamification";
 
 /**
  * Concurrency and integrity tests against a REAL Postgres database.
@@ -75,11 +76,11 @@ async function seed(client: PrismaClient): Promise<Seeded> {
       endAt: new Date(Date.now() + 86_400_000),
       status: "ACTIVE",
       requiredWatchPercent: 90,
-      rewardCredits: 10,
+      rewardCredits: SUPPORT_TRANSFER_CREDITS,
       rewardXp: 25,
-      // Budget sized to exactly CAPACITY payouts: the atomic conditional update
+      // Budget sized to exactly CAPACITY transfers: the atomic conditional update
       // is what must stop the (CAPACITY + 1)-th completion.
-      budgetCredits: 10 * CAPACITY,
+      budgetCredits: SUPPORT_TRANSFER_CREDITS * CAPACITY,
       maxTotalSupports: CAPACITY,
       tasks: { create: [{ type: "WATCH_VIDEO", required: true, sortOrder: 0 }] },
     },
@@ -195,6 +196,24 @@ describe.skipIf(!enabled)("support completion under concurrency", () => {
       // The budget was never overspent.
       const campaign = await client.campaign.findUniqueOrThrow({ where: { id: fixture.campaignId } });
       expect(campaign.spentCredits).toBeLessThanOrEqual(campaign.budgetCredits);
+
+      // CREDIT CONSERVATION, measured end to end: what left the campaign's escrow
+      // equals what arrived in supporter balances. A creator payout, a mutual bonus
+      // or a task bonus paid in credits would break this equality, which is exactly
+      // why they are all XP now.
+      const supporterCredits = await client.creditLedger.aggregate({
+        where: { campaignId: fixture.campaignId, type: "SUPPORT_COMPLETED" },
+        _sum: { amount: true },
+      });
+      expect(supporterCredits._sum.amount ?? 0).toBe(campaign.spentCredits);
+      expect(campaign.spentCredits).toBe(SUPPORT_TRANSFER_CREDITS * CAPACITY);
+
+      // And the creator received no credits for being supported.
+      const creatorReceipts = await client.creditLedger.aggregate({
+        where: { userId: fixture.creatorId, amount: { gt: 0 } },
+        _sum: { amount: true },
+      });
+      expect(creatorReceipts._sum.amount ?? 0).toBe(0);
 
       // Every paid supporter's cached balance matches their ledger.
       for (const supporterId of fixture.supporterIds) {

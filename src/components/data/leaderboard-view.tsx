@@ -56,7 +56,7 @@ const PERIODS = [
 const MODES = [
   { value: "TOP_SUPPORTERS", label: "حامیان برتر" },
   { value: "TOP_CREATORS", label: "سازندگان برتر" },
-  { value: "HIGHEST_REPUTATION", label: "بالاترین اعتبار" },
+  { value: "HIGHEST_REPUTATION", label: "بالاترین اعتبار کیفی" },
   { value: "RISING", label: "در حال رشد" },
 ] as const;
 

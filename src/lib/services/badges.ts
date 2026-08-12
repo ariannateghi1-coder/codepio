@@ -1,7 +1,7 @@
 import "server-only";
 import type { Prisma } from "@prisma/client";
 import { BADGE_DEFINITIONS, BADGE_REQUIREMENTS, type BadgeCode } from "../gamification";
-import { ledgerKey, recordCredit, recordXp } from "./ledger";
+import { ledgerKey, recordXp } from "./ledger";
 import { createNotificationTx } from "./notifications";
 
 /**
@@ -11,6 +11,9 @@ import { createNotificationTx } from "./notifications";
  *  - Idempotent: a badge is awarded at most once per user, enforced by the
  *    UserBadge composite primary key, and its reward goes through the ledger
  *    with a deterministic idempotency key.
+ *  - XP-only rewards. Credits are a closed transfer economy (see the CREDIT
+ *    CONSERVATION note in src/lib/gamification.ts); a badge has no paying
+ *    counterparty, so a credit reward would mint currency from nothing.
  *  - Quality-aware: only ACTIVE (non-reversed) supports count, and quality
  *    badges additionally require a minimum completion rate, so pure farming
  *    doesn't unlock "Trusted Supporter".
@@ -92,7 +95,7 @@ async function loadMetrics(tx: Tx, userId: string): Promise<UserMetrics> {
   };
 }
 
-export type AwardedBadge = { code: string; name: string; icon: string; credits: number; xp: number };
+export type AwardedBadge = { code: string; name: string; icon: string; xp: number };
 
 /**
  * Evaluates and awards badges for a user, inside the caller's transaction so
@@ -124,15 +127,6 @@ export async function evaluateBadges(tx: Tx, userId: string): Promise<AwardedBad
       data: { userId, actorId: userId, type: "BADGE_EARNED", targetId: badge.id, metadata: { code: badge.code } },
     });
 
-    if (badge.rewardCredits > 0) {
-      await recordCredit(tx, {
-        userId,
-        type: "BADGE_REWARD",
-        amount: badge.rewardCredits,
-        idempotencyKey: ledgerKey(["badge-credits", userId, badge.code]),
-        reason: `badge:${badge.code}`,
-      });
-    }
     if (badge.rewardXp > 0) {
       await recordXp(tx, {
         userId,
@@ -148,7 +142,7 @@ export async function evaluateBadges(tx: Tx, userId: string): Promise<AwardedBad
       type: "SYSTEM",
       title: `نشان جدید: ${badge.name}`,
       message: badge.description,
-      metadata: { badgeCode: badge.code, credits: badge.rewardCredits, xp: badge.rewardXp },
+      metadata: { badgeCode: badge.code, xp: badge.rewardXp },
       dedupeKey: ledgerKey(["badge-notification", userId, badge.code]),
     });
 
@@ -156,7 +150,6 @@ export async function evaluateBadges(tx: Tx, userId: string): Promise<AwardedBad
       code: badge.code,
       name: badge.name,
       icon: badge.icon,
-      credits: badge.rewardCredits,
       xp: badge.rewardXp,
     });
   }

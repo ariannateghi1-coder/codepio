@@ -245,7 +245,7 @@ export function AppShell({ children }: { children: React.ReactNode }) {
           {viewer && (
             <dl className="grid grid-cols-2 gap-2 text-center">
               <div className="rounded-lg bg-surface-sunken p-2">
-                <dt className="text-[0.6875rem] text-fg-subtle">اعتبار</dt>
+                <dt className="text-[0.6875rem] text-fg-subtle">اعتبار</dt>{/* credits (spendable) */}
                 <dd className="numeric text-sm font-bold text-fg">{formatNumber(viewer.credits)}</dd>
               </div>
               <div className="rounded-lg bg-surface-sunken p-2">

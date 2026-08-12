@@ -4,22 +4,43 @@ import {
   campaignSettlementCost,
   isCampaignAvailable,
 } from "@/lib/services/campaign-eligibility";
+import { SUPPORT_TRANSFER_CREDITS } from "@/lib/gamification";
 
 const available = {
   budgetCredits: 100,
   spentCredits: 0,
-  rewardCredits: 10,
   maxTotalSupports: 10,
   dailyLimit: 5,
   totalSupports: 0,
   dailySupports: 0,
-  tasks: [{ required: false, rewardCredits: 2 }],
 };
 
 describe("campaign eligibility", () => {
-  it("uses the worst-case full settlement cost", () => {
-    expect(campaignSettlementCost(available)).toBe(12);
-    expect(campaignAvailabilityFailure({ ...available, budgetCredits: 11 })).toBe("CAMPAIGN_BUDGET_EXHAUSTED");
+  it("costs one fixed transfer per support, regardless of campaign config", () => {
+    expect(campaignSettlementCost()).toBe(SUPPORT_TRANSFER_CREDITS);
+  });
+
+  it("refuses a campaign whose remaining escrow cannot cover one transfer", () => {
+    expect(
+      campaignAvailabilityFailure({ ...available, budgetCredits: SUPPORT_TRANSFER_CREDITS - 1 })
+    ).toBe("CAMPAIGN_BUDGET_EXHAUSTED");
+    expect(
+      campaignAvailabilityFailure({
+        ...available,
+        budgetCredits: SUPPORT_TRANSFER_CREDITS * 4,
+        spentCredits: SUPPORT_TRANSFER_CREDITS * 4,
+      })
+    ).toBe("CAMPAIGN_BUDGET_EXHAUSTED");
+  });
+
+  it("admits a campaign with exactly one transfer left", () => {
+    expect(
+      isCampaignAvailable({
+        ...available,
+        budgetCredits: SUPPORT_TRANSFER_CREDITS * 4,
+        spentCredits: SUPPORT_TRANSFER_CREDITS * 3,
+      })
+    ).toBe(true);
   });
 
   it("applies capacity and rolling daily limits consistently", () => {

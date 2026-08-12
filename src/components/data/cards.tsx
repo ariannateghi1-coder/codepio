@@ -189,7 +189,9 @@ export function ExploreCard({
             </div>
             <dl className="mt-3 grid grid-cols-2 gap-2 text-center">
               <div className="rounded-lg bg-surface-sunken py-1.5">
-                <dt className="text-[0.625rem] text-fg-subtle">اعتبار</dt>
+                {/* Reputation, not credits. Both were labelled «اعتبار», which made a
+                    trust score read as a spendable balance. */}
+                <dt className="text-[0.625rem] text-fg-subtle">اعتبار کیفی</dt>
                 <dd className="numeric text-sm font-bold">{formatNumber(data.creator.reputation)}</dd>
               </div>
               <div className="rounded-lg bg-surface-sunken py-1.5">
@@ -275,6 +277,7 @@ export function ExploreCard({
           <span className="flex items-center gap-3 text-xs font-bold">
             <span className="inline-flex items-center gap-1 text-accent">
               <Coins aria-hidden size={13} />
+              {/* Same on every card by design: the credit leg is a fixed transfer. */}
               <span className="numeric">+{formatNumber(data.reward.credits)}</span> اعتبار
             </span>
             <span className="inline-flex items-center gap-1 text-info">
@@ -335,7 +338,7 @@ export function MemberCard({
 
       <dl className="mt-4 grid grid-cols-3 gap-2 text-center">
         <div className="rounded-lg bg-surface-sunken py-2">
-          <dt className="text-[0.6875rem] text-fg-subtle">اعتبار</dt>
+          <dt className="text-[0.6875rem] text-fg-subtle">اعتبار کیفی</dt>
           <dd className="numeric text-sm font-bold">{formatNumber(user.reputation)}</dd>
         </div>
         <div className="rounded-lg bg-surface-sunken py-2">

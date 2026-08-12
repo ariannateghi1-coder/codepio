@@ -13,36 +13,82 @@
 
 import type { RankTier, TaskType } from "@prisma/client";
 
-/** Default per-task rewards. A campaign may override them per task. */
-export const TASK_REWARDS: Record<TaskType, { credits: number; xp: number }> = {
-  WATCH_VIDEO: { credits: 5, xp: 12 },
-  SUBSCRIBE_CHANNEL: { credits: 3, xp: 8 },
-  LIKE_VIDEO: { credits: 2, xp: 5 },
-  COMMENT_VIDEO: { credits: 1, xp: 3 },
+/**
+ * CREDIT CONSERVATION — the core invariant of the credit economy.
+ * ──────────────────────────────────────────────────────────────
+ * Credits are closed and zero-sum. In the support path exactly ONE amount moves,
+ * and it moves from the campaign creator's funded budget to the supporter:
+ *
+ *   creator budget  −SUPPORT_TRANSFER_CREDITS  →  supporter  +SUPPORT_TRANSFER_CREDITS
+ *
+ * The same constant is both the debit and the credit, so no creator can pay less
+ * and no supporter can receive more than anyone else. It is a platform constant,
+ * not a campaign field: nothing in any request body can change it.
+ *
+ * Consequently NOTHING else may create or destroy credits. Mutual bonuses,
+ * optional-task bonuses, streaks, badges and referrals are all paid in XP only —
+ * XP is progression, not currency, so varying it cannot unbalance anything.
+ *
+ * The only credit SOURCE in the system is SIGNUP_GRANT_CREDITS, granted once per
+ * account through the ledger. Therefore, at all times:
+ *
+ *   Σ User.credits + Σ (Campaign.budgetCredits − Campaign.spentCredits)
+ *     === SIGNUP_GRANT_CREDITS × (accounts granted)   [± admin adjustments]
+ */
+export const SUPPORT_TRANSFER_CREDITS = 10;
+
+/**
+ * One-time grant every account receives, so a new user can fund a first campaign
+ * before having earned anything. Written through the ledger like every other
+ * movement, so it is visible and auditable rather than an invisible starting
+ * balance.
+ */
+export const SIGNUP_GRANT_CREDITS = 50;
+
+/**
+ * Default per-task rewards — XP ONLY.
+ *
+ * Task-level CREDIT rewards were removed deliberately: a second per-task credit
+ * amount is precisely how one supporter ends up paid more than another for the
+ * same work, and how a creator's debit stops matching the supporter's credit.
+ */
+export const TASK_REWARDS: Record<TaskType, { xp: number }> = {
+  WATCH_VIDEO: { xp: 12 },
+  SUBSCRIBE_CHANNEL: { xp: 8 },
+  LIKE_VIDEO: { xp: 5 },
+  COMMENT_VIDEO: { xp: 3 },
 };
 
 export const REWARDS = {
-  /** Paid to the supporter when a session completes with all required tasks. */
-  SUPPORT_COMPLETED: { credits: 10, xp: 25 },
-  /** Paid to the creator when they receive a verified support. */
-  SUPPORT_RECEIVED: { credits: 3, xp: 10 },
-  /** Extra for a genuine two-way exchange (first time for a pair only). */
-  MUTUAL_BONUS: { credits: 4, xp: 10 },
-  /** Referral payout, released on the referred user's first verified support. */
-  REFERRAL: { credits: 20, xp: 40 },
-  /** Streak milestones, keyed by consecutive active days. */
+  /**
+   * The support settlement. `credits` is the transferred amount and is fixed to
+   * SUPPORT_TRANSFER_CREDITS by definition — it is what leaves the creator's
+   * budget and what arrives in the supporter's balance, the same number twice.
+   */
+  SUPPORT_COMPLETED: { credits: SUPPORT_TRANSFER_CREDITS, xp: 25 },
+  /** Creator's side of a verified support. XP only: crediting them too would mint. */
+  SUPPORT_RECEIVED: { xp: 10 },
+  /** Genuine two-way exchange, first time for a pair. XP only. */
+  MUTUAL_BONUS: { xp: 10 },
+  /** Referral payout on the referred user's first verified support. XP only. */
+  REFERRAL: { xp: 40 },
+  /** Streak milestones, keyed by consecutive active days. XP only. */
   STREAK: {
-    3: { credits: 3, xp: 10 },
-    7: { credits: 8, xp: 30 },
-    14: { credits: 18, xp: 70 },
-    30: { credits: 40, xp: 150 },
-  } as Record<number, { credits: number; xp: number }>,
+    3: { xp: 10 },
+    7: { xp: 30 },
+    14: { xp: 70 },
+    30: { xp: 150 },
+  } as Record<number, { xp: number }>,
 } as const;
 
 /**
- * Anti-farming: repeat support for the SAME pair pays progressively less.
+ * Anti-farming: repeat support for the SAME pair earns progressively less XP.
  * Index = how many times this supporter has already supported this creator.
  * Beyond the table, the last multiplier applies.
+ *
+ * Applies to XP ONLY. It must never scale credits: the credit leg is a transfer,
+ * so reducing what the supporter receives without reducing what the creator pays
+ * would destroy credits and break conservation.
  */
 export const PAIR_DIMINISHING_MULTIPLIERS = [1, 0.6, 0.35, 0.2, 0.1] as const;
 
@@ -174,15 +220,15 @@ export const NEW_CREATOR_BOOST = {
 } as const;
 
 export const BADGE_DEFINITIONS = [
-  { code: "FIRST_SUPPORT", name: "اولین حمایت", description: "اولین حمایت تأییدشده خود را کامل کردید.", icon: "❤️", credits: 2, xp: 10 },
-  { code: "SUPPORTS_10", name: "حامی فعال", description: "۱۰ حمایت تأییدشده انجام دادید.", icon: "🤝", credits: 5, xp: 25 },
-  { code: "SUPPORTS_50", name: "همراه جامعه", description: "۵۰ حمایت تأییدشده انجام دادید.", icon: "🌱", credits: 15, xp: 80 },
-  { code: "SUPPORTS_100", name: "قهرمان جامعه", description: "۱۰۰ حمایت تأییدشده انجام دادید.", icon: "🏆", credits: 40, xp: 200 },
-  { code: "TRUSTED_SUPPORTER", name: "حامی مورد اعتماد", description: "اعتبار بالا با نرخ تکمیل عالی.", icon: "🛡️", credits: 20, xp: 100 },
-  { code: "PERFECT_WEEK", name: "هفته بی‌نقص", description: "۷ روز فعالیت پیوسته.", icon: "🔥", credits: 10, xp: 50 },
-  { code: "RISING_CREATOR", name: "سازنده در حال رشد", description: "۲۵ حمایت تأییدشده دریافت کردید.", icon: "🚀", credits: 15, xp: 75 },
-  { code: "COMMUNITY_BUILDER", name: "سازنده جامعه", description: "۱۰ حمایت متقابل واقعی.", icon: "🌍", credits: 12, xp: 60 },
-  { code: "VERIFIED_CREATOR", name: "کانال تأییدشده", description: "مالکیت کانال یوتیوب را تأیید کردید.", icon: "✅", credits: 10, xp: 40 },
+  { code: "FIRST_SUPPORT", name: "اولین حمایت", description: "اولین حمایت تأییدشده خود را کامل کردید.", icon: "❤️", xp: 10 },
+  { code: "SUPPORTS_10", name: "حامی فعال", description: "۱۰ حمایت تأییدشده انجام دادید.", icon: "🤝", xp: 25 },
+  { code: "SUPPORTS_50", name: "همراه جامعه", description: "۵۰ حمایت تأییدشده انجام دادید.", icon: "🌱", xp: 80 },
+  { code: "SUPPORTS_100", name: "قهرمان جامعه", description: "۱۰۰ حمایت تأییدشده انجام دادید.", icon: "🏆", xp: 200 },
+  { code: "TRUSTED_SUPPORTER", name: "حامی مورد اعتماد", description: "اعتبار بالا با نرخ تکمیل عالی.", icon: "🛡️", xp: 100 },
+  { code: "PERFECT_WEEK", name: "هفته بی‌نقص", description: "۷ روز فعالیت پیوسته.", icon: "🔥", xp: 50 },
+  { code: "RISING_CREATOR", name: "سازنده در حال رشد", description: "۲۵ حمایت تأییدشده دریافت کردید.", icon: "🚀", xp: 75 },
+  { code: "COMMUNITY_BUILDER", name: "سازنده جامعه", description: "۱۰ حمایت متقابل واقعی.", icon: "🌍", xp: 60 },
+  { code: "VERIFIED_CREATOR", name: "کانال تأییدشده", description: "مالکیت کانال یوتیوب را تأیید کردید.", icon: "✅", xp: 40 },
 ] as const;
 
 export type BadgeCode = (typeof BADGE_DEFINITIONS)[number]["code"];

@@ -6,6 +6,7 @@ import { NotFoundError, BusinessRuleError } from "@/lib/errors";
 import { writeAudit } from "@/lib/audit";
 import { debitBudget, endCampaignWithRefund, estimateSupports } from "@/lib/services/budget";
 import { ledgerKey, recordCredit } from "@/lib/services/ledger";
+import { SUPPORT_TRANSFER_CREDITS } from "@/lib/gamification";
 
 /**
  * Creator campaign management.
@@ -62,10 +63,10 @@ export const GET = active(
             ...stats,
             completionRate: stats.started === 0 ? null : Math.round((stats.completed / stats.started) * 100),
             budgetRemaining: campaign.budgetCredits > 0 ? campaign.budgetCredits - campaign.spentCredits : null,
-            /** Roughly how many more supports the remaining budget can pay for. */
+            /** How many more supports the remaining escrow can pay for. */
             supportsRemaining:
               campaign.budgetCredits > 0
-                ? estimateSupports(campaign.budgetCredits - campaign.spentCredits, campaign.rewardCredits)
+                ? estimateSupports(campaign.budgetCredits - campaign.spentCredits)
                 : null,
           },
         };
@@ -108,7 +109,9 @@ export const POST = active(
           endAt: data.endAt,
           status: "ACTIVE",
           requiredWatchPercent: data.requiredWatchPercent,
-          rewardCredits: data.rewardCredits,
+          // Fixed platform transfer, not client input: every campaign pays the
+          // same amount per support and is charged that same amount.
+          rewardCredits: SUPPORT_TRANSFER_CREDITS,
           rewardXp: data.rewardXp,
           budgetCredits: data.budgetCredits,
           maxTotalSupports: data.maxTotalSupports ?? null,
@@ -120,11 +123,11 @@ export const POST = active(
               type: task.type,
               required: task.required,
               sortOrder: index,
-              // Canonical reward model: required tasks carry no reward of their own
-              // (their value is in the campaign's rewardCredits), and only an
-              // optional task may add a bonus. The validator already rejects a paid
-              // required task; this is the belt to that braces.
-              rewardCredits: task.required ? 0 : task.rewardCredits,
+              // Per-task CREDIT rewards are always zero — the whole credit leg is
+              // the campaign transfer, so a task-level credit would be paid out of
+              // nothing. Only an optional task may add an XP bonus. The validator
+              // already rejects a paid required task; this is the belt to that braces.
+              rewardCredits: 0,
               rewardXp: task.required ? 0 : task.rewardXp,
             })),
           },
@@ -140,6 +143,8 @@ export const POST = active(
         campaignId: created.id,
         amount: data.budgetCredits,
         note: "campaign budget funded at creation",
+        // The campaign id is freshly generated, so this key is unique per campaign.
+        idempotencyKey: ledgerKey(["campaign-budget-initial", created.id]),
       });
 
       return created;
@@ -220,30 +225,56 @@ export const PATCH = active(
       if (locked.status === "ENDED") throw new BusinessRuleError("کمپین پایان‌یافته قابل تغییر نیست.");
 
       if (data.action === "EDIT" && data.budgetCredits !== undefined) {
-        // Budget can be raised (charging only the delta) or lowered, but never
+        // Budget can be raised (escrowing only the delta) or lowered, but never
         // below what is already spent — the remaining budget would read negative.
         if (data.budgetCredits < locked.spentCredits) {
           throw new BusinessRuleError("بودجه جدید نمی‌تواند کمتر از مقدار مصرف‌شده باشد.");
         }
         const delta = data.budgetCredits - locked.budgetCredits;
+
+        // Both idempotency keys below identify the TRANSITION (from → to), not the
+        // delta size. A key built from the delta alone repeats — 100→150, 150→100,
+        // 100→150 yields the same "50" twice — and the ledger would treat the
+        // second charge as an applied replay, raising the budget without taking
+        // the credits. Since the row is held FOR UPDATE and the transition is read
+        // from the locked row, the same transition cannot interleave with itself.
         if (delta > 0) {
           await debitBudget(tx, {
             creatorId: user.id,
             campaignId: campaign.id,
             amount: delta,
             note: "campaign budget increased",
+            idempotencyKey: ledgerKey([
+              "campaign-budget-increase",
+              campaign.id,
+              locked.budgetCredits,
+              data.budgetCredits,
+            ]),
           });
         } else if (delta < 0) {
-          // Lowering returns the difference: the creator paid for exposure they
-          // are choosing not to use.
-          await recordCredit(tx, {
+          // Lowering returns the difference from escrow: the creator reserved
+          // credits for exposure they are choosing not to use.
+          const refund = await recordCredit(tx, {
             userId: user.id,
             type: "CAMPAIGN_BUDGET_SPEND",
             amount: -delta,
-            idempotencyKey: ledgerKey(["campaign-budget-decrease", campaign.id, locked.budgetCredits, data.budgetCredits]),
+            idempotencyKey: ledgerKey([
+              "campaign-budget-decrease",
+              campaign.id,
+              locked.budgetCredits,
+              data.budgetCredits,
+            ]),
             campaignId: campaign.id,
             reason: "campaign budget decreased",
           });
+          // Mirror image of the debit guard: if the refund did not actually apply,
+          // lowering the budget anyway would silently destroy the difference.
+          if (!refund.applied) {
+            throw new BusinessRuleError(
+              "این تغییر بودجه قبلاً ثبت شده است. صفحه را تازه کنید و در صورت نیاز دوباره تلاش کنید.",
+              { rule: "BUDGET_REFUND_REPLAYED" }
+            );
+          }
         }
         patch.budgetCredits = data.budgetCredits;
       }

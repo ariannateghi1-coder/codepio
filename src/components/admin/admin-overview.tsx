@@ -30,6 +30,8 @@ type Overview = {
     ledgerCredits: number;
     cachedXp: number;
     ledgerXp: number;
+    escrowedCredits: number;
+    totalSupply: number;
     consistent: boolean;
   };
   systemHealth: { ready: boolean; missing: string[] };
@@ -115,7 +117,17 @@ export function AdminOverview() {
           tone={data.moderation.openReports > 0 ? "warning" : "neutral"}
         />
         <Metric label="کمپین فعال" value={formatNumber(data.campaigns.active)} />
-        <Metric label="اعتبار صادرشده (هفته)" value={formatNumber(data.economy.creditsIssuedWeek)} tone="accent" />
+        <Metric
+          label="اعتبار تازه (هفته)"
+          value={formatNumber(data.economy.creditsIssuedWeek)}
+          hint="فقط هدیه ثبت‌نام؛ حمایت اعتبار نمی‌سازد"
+          tone="accent"
+        />
+        <Metric
+          label="کل اعتبار موجود"
+          value={formatNumber(data.economy.totalSupply)}
+          hint={`${formatNumber(data.economy.escrowedCredits)} در بودجه کمپین‌ها`}
+        />
         <Metric
           label="حمایت برگشتی (هفته)"
           value={formatNumber(data.supports.reversedWeek)}

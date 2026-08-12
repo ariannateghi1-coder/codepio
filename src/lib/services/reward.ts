@@ -1,50 +1,50 @@
-import { REWARDS, TASK_REWARDS, pairRewardMultiplier } from "../gamification";
+import { REWARDS, SUPPORT_TRANSFER_CREDITS, TASK_REWARDS, pairRewardMultiplier } from "../gamification";
 import type { TaskType } from "@prisma/client";
 
 /**
- * Reward settlement — the single, canonical reward model.
+ * Reward settlement — the single, canonical model.
  *
- * The schema previously allowed two parallel reward models: `Campaign.rewardCredits`
- * AND `CampaignTask.rewardCredits`. Nothing summed them, nothing validated them
- * against each other, and either one could plausibly have been "the" reward. Two
- * ambiguous models is how double counting happens, so the ambiguity is resolved
- * here, once:
+ * ═══════════════════════════════════════════════════════════════════════════
+ * CREDIT CONSERVATION
+ * ═══════════════════════════════════════════════════════════════════════════
+ * A support moves ONE credit amount, and it is a TRANSFER, not a payout:
  *
- *   CANONICAL MODEL
- *   ───────────────
- *   base    = Campaign.rewardCredits / rewardXp
- *             The reward for satisfying ALL REQUIRED tasks. This is the number the
- *             Explore card promises, and required tasks therefore carry no reward
- *             of their own — their value is already inside `base`.
+ *     creator budget  −transferCredits  →  supporter  +transferCredits
  *
- *   bonus   = Σ CampaignTask.rewardCredits for SATISFIED OPTIONAL tasks
- *             Optional tasks are the only place task-level rewards apply. A
- *             required task with a non-zero reward is rejected at creation time.
+ * `transferCredits` is always SUPPORT_TRANSFER_CREDITS, a platform constant.
+ * It is:
+ *   • the same for every campaign, so no creator can pay less than another;
+ *   • the same for every supporter, so no supporter can receive more;
+ *   • not derived from any request field, so nothing a client sends can change it;
+ *   • charged to the budget at exactly the amount paid out, so no credits are
+ *     created or destroyed by a support.
  *
- *   mutual  = REWARDS.MUTUAL_BONUS, paid once per pair on the first genuine
- *             two-way exchange.
+ * Everything else a support can earn is XP:
+ *   • optional-task bonuses  → XP only
+ *   • mutual-exchange bonus  → XP only
+ *   • the creator's own side  → XP only
  *
- *   final   = round(base × pairMultiplier) + bonus + mutual
- *             The pair multiplier applies to `base` only: diminishing returns are
- *             about repeatedly supporting the same creator, not about punishing
- *             someone for leaving a comment.
+ * This is why the function returns `creatorXp` but NO `creatorCredits`: paying
+ * the creator credits for receiving support would mint currency out of nothing,
+ * and it is what previously let total credits grow without bound.
  *
- * Every figure the user is shown comes from this function, and the ledger writes
- * exactly these components with one idempotency key each. There is no other place
- * in the codebase that decides what a support is worth.
+ * The pair diminishing multiplier applies to XP ONLY. Scaling the credit leg
+ * would mean the supporter receives less than the creator was charged, which
+ * destroys credits — the mirror image of minting, and equally a break of the
+ * invariant. Repeat-pair farming is instead discouraged through XP (which drives
+ * level and leaderboard) and through the risk engine.
+ * ═══════════════════════════════════════════════════════════════════════════
  */
 
 export type SettlementTask = {
   type: TaskType;
   required: boolean;
   satisfied: boolean;
-  /** Task-level reward from the campaign config. Only honoured when optional. */
-  rewardCredits: number;
+  /** XP bonus from the campaign config. Only honoured when the task is optional. */
   rewardXp: number;
 };
 
 export type SettlementInput = {
-  baseCredits: number;
   baseXp: number;
   tasks: SettlementTask[];
   /** How many times this supporter already supported this creator. */
@@ -63,20 +63,29 @@ export type SettlementComponent = {
 };
 
 export type Settlement = {
-  /** Campaign base after the pair multiplier. */
+  /**
+   * The credit transfer. Always SUPPORT_TRANSFER_CREDITS, in both directions:
+   * debited from the campaign budget, credited to the supporter.
+   */
+  transferCredits: number;
+  /** Base component: the credit transfer plus base XP after the pair multiplier. */
   base: SettlementComponent;
-  /** One entry per satisfied optional task. */
+  /** One entry per satisfied optional task. XP only. */
   taskBonuses: SettlementComponent[];
-  /** Mutual-exchange bonus, or null when it does not apply. */
+  /** Mutual-exchange bonus, XP only, or null when it does not apply. */
   mutualBonus: SettlementComponent | null;
+  /** Applies to XP only — never to transferCredits. */
   multiplier: number;
-  /** What the supporter is paid in total. */
+  /** What the supporter receives. Equals transferCredits, by construction. */
   totalCredits: number;
   totalXp: number;
-  /** What the creator is paid for receiving verified support. */
-  creatorCredits: number;
+  /** The creator's own side of a verified support: XP only, never credits. */
   creatorXp: number;
-  /** Credits that must be available in the campaign budget for this settlement. */
+  /**
+   * Credits that must be available in the campaign budget. Equals totalCredits
+   * and transferCredits — the three are the same number by construction, which
+   * is what makes the transfer conservative.
+   */
   budgetCost: number;
 };
 
@@ -88,70 +97,69 @@ const TASK_LABELS: Record<TaskType, string> = {
 };
 
 /**
- * Computes a full settlement breakdown. Pure and total: same input, same output,
- * no clamping surprises — negative or absurd configuration is normalised here so
- * no caller has to defend against it.
+ * Computes a full settlement breakdown. Pure and total: same input, same output.
+ * Note there is no `baseCredits` input — the credit leg is a constant, so there
+ * is nothing for a caller to pass in and nothing to get wrong.
  */
 export function computeSettlement(input: SettlementInput): Settlement {
   const multiplier = pairRewardMultiplier(Math.max(0, input.priorPairSupports));
 
-  const baseCredits = Math.max(0, Math.round(nonNegative(input.baseCredits) * multiplier));
+  // XP is scaled by the pair multiplier. Credits are NOT: see the header.
   const baseXp = Math.max(0, Math.round(nonNegative(input.baseXp) * multiplier));
+  const transferCredits = SUPPORT_TRANSFER_CREDITS;
 
   const base: SettlementComponent = {
     key: "base",
-    label: multiplier < 1 ? `پاداش پایه (ضریب ${multiplier})` : "پاداش پایه",
-    credits: baseCredits,
+    label: multiplier < 1 ? `پاداش پایه (ضریب XP ${multiplier})` : "پاداش پایه",
+    credits: transferCredits,
     xp: baseXp,
   };
 
-  // Only satisfied OPTIONAL tasks contribute a bonus. Required-task rewards are
-  // deliberately ignored even if present in old data: their value is in `base`.
+  // Only satisfied OPTIONAL tasks contribute a bonus, and only in XP.
   const taskBonuses: SettlementComponent[] = input.tasks
     .filter((task) => !task.required && task.satisfied)
     .map((task) => ({
       key: `task:${task.type}`,
       label: `${TASK_LABELS[task.type] ?? task.type} (اختیاری)`,
-      credits: nonNegative(task.rewardCredits),
+      credits: 0,
       xp: nonNegative(task.rewardXp),
     }))
-    .filter((bonus) => bonus.credits > 0 || bonus.xp > 0);
+    .filter((bonus) => bonus.xp > 0);
 
   const mutualBonus: SettlementComponent | null = input.firstMutualForPair
     ? {
         key: "mutual",
         label: "پاداش حمایت متقابل",
-        credits: REWARDS.MUTUAL_BONUS.credits,
+        credits: 0,
         xp: REWARDS.MUTUAL_BONUS.xp,
       }
     : null;
 
   const components = [base, ...taskBonuses, ...(mutualBonus ? [mutualBonus] : [])];
-  const totalCredits = components.reduce((sum, part) => sum + part.credits, 0);
   const totalXp = components.reduce((sum, part) => sum + part.xp, 0);
 
   return {
+    transferCredits,
     base,
     taskBonuses,
     mutualBonus,
     multiplier,
-    totalCredits,
+    // Identical by construction: the supporter receives exactly the transfer, and
+    // the budget is charged exactly the transfer.
+    totalCredits: transferCredits,
     totalXp,
-    creatorCredits: REWARDS.SUPPORT_RECEIVED.credits,
     creatorXp: REWARDS.SUPPORT_RECEIVED.xp,
-    // The creator's own payout is platform-funded, not campaign-funded: charging
-    // a creator's budget for the reward they receive would be circular.
-    budgetCost: totalCredits,
+    budgetCost: transferCredits,
   };
 }
 
 /**
- * Default task-level bonus for an optional task, used when a campaign does not
- * specify one. Required tasks get 0 — their reward lives in the campaign base.
+ * Default XP bonus for an optional task, used when a campaign does not specify
+ * one. Required tasks get 0 — their value is inside the campaign base.
  */
-export function defaultTaskBonus(type: TaskType, required: boolean): { credits: number; xp: number } {
-  if (required) return { credits: 0, xp: 0 };
-  return { credits: TASK_REWARDS[type].credits, xp: TASK_REWARDS[type].xp };
+export function defaultTaskBonus(type: TaskType, required: boolean): { xp: number } {
+  if (required) return { xp: 0 };
+  return { xp: TASK_REWARDS[type].xp };
 }
 
 /** Human-readable component list, for the UI and for audit metadata. */

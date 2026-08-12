@@ -103,6 +103,10 @@ export const GET = authed(
         .filter((row) => types.includes(row.type))
         .reduce((total, row) => total + (row._sum.amount ?? 0), 0);
 
+    // SUPPORT_COMPLETED is the transfer received from campaign budgets — the only
+    // ongoing way to earn. The other types are listed because historical rows may
+    // still carry them; nothing writes them any more (see the CREDIT CONSERVATION
+    // note in gamification.ts), so on a fresh database they sum to zero.
     const earned = sumOf([
       "SUPPORT_COMPLETED",
       "SUPPORT_RECEIVED",
@@ -111,6 +115,7 @@ export const GET = authed(
       "REFERRAL",
       "BADGE_REWARD",
     ]);
+    const granted = sumOf(["SIGNUP_GRANT"]);
     const budgetFlow = sumOf(["CAMPAIGN_BUDGET_SPEND"]);
     const reversedCredits = sumOf(["REVERSAL", "PENALTY"]);
     const adjustments = sumOf(["ADMIN_ADJUSTMENT"]);
@@ -142,14 +147,27 @@ export const GET = authed(
         weeklyRank: standing.rank,
       },
       /**
-       * Credit wallet. `spentOnExposure` is negative-summed budget flow, i.e. what
-       * the creator actually paid for exposure minus anything refunded, which is
-       * the number that makes the earn→spend loop legible.
+       * Credit wallet.
+       *
+       * `escrowed` is the live figure people ask about first: credits that left the
+       * balance into a running campaign and have not been handed to a supporter yet.
+       * It is derived as (budget − spent) over the user's own active campaigns, not
+       * from the ledger, because the ledger records the movement into escrow and the
+       * movement out of it, not what is currently sitting there.
+       *
+       * `spentOnExposure` is net negative budget flow: escrowed minus refunded. With
+       * credits being a closed transfer economy, granted + earned − spentOnExposure
+       * − reversed + adjustments reconciles to `balance`.
        */
       wallet: {
         balance: user.credits,
+        granted,
         earned,
         spentOnExposure: Math.max(0, -budgetFlow),
+        escrowed: activeCampaigns.reduce(
+          (sum, campaign) => sum + Math.max(0, campaign.budgetCredits - campaign.spentCredits),
+          0
+        ),
         reversed: Math.max(0, -reversedCredits),
         adjustments,
         pending: pendingRewards,

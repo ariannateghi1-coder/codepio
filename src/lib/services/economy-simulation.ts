@@ -1,36 +1,31 @@
-import { BADGE_DEFINITIONS, REWARDS } from "../gamification";
+import { SIGNUP_GRANT_CREDITS, SUPPORT_TRANSFER_CREDITS } from "../gamification";
 
 export type EconomySimulationInput = {
   users: number;
   supportsPerUserPerDay: number;
   days?: number;
-  supporterBaseCredits?: number;
-  creatorCredits?: number;
-  optionalTaskCreditsPerSupport?: number;
-  mutualRate?: number;
-  referralRate?: number;
-  streakCreditsPerUser?: number;
-  badgeCreditsPerUser?: number;
-  budgetSpendPerSupport?: number;
+  /** Per-account one-time grant. Defaults to the platform constant. */
+  signupGrantCredits?: number;
+  /** Credits moved per completed support. Defaults to the platform constant. */
+  transferPerSupport?: number;
 };
 
 export type EconomySimulationResult = {
   assumptions: Required<EconomySimulationInput>;
   supports: number;
-  sources: {
-    supporter: number;
-    creator: number;
-    mutual: number;
-    task: number;
-    referral: number;
-    streak: number;
-    badge: number;
-    total: number;
-  };
-  sinks: { budgetSpend: number; total: number };
+  /** Credits created. Only the signup grant creates credits. */
+  issuance: number;
+  /**
+   * Credits moved between balances. Not issuance: every unit debited from a
+   * creator's escrow is credited to a supporter, so this nets to zero.
+   */
+  transferVolume: number;
   netIssuance: number;
   netPerSupport: number;
-  budgetCoverageRatio: number;
+  /** Total credits in existence after the modelled period. */
+  totalSupply: number;
+  /** True when no modelled activity changes the total supply. */
+  conservative: boolean;
 };
 
 const finiteNonNegative = (value: number, name: string): number => {
@@ -39,52 +34,44 @@ const finiteNonNegative = (value: number, name: string): number => {
 };
 
 /**
- * Deterministic, parameter-driven credit economy projection.
+ * Deterministic projection of the credit supply.
  *
- * Sources are ledger credits minted for participants. Campaign funding is the
- * sink: credits leave creators when a budget is funded. `spentCredits` is budget
- * consumption, not a second sink, so it is deliberately not subtracted twice.
+ * The previous version modelled a set of independent credit "sources" (supporter
+ * payout, creator payout, mutual, task, referral, streak, badge) against a single
+ * "sink" (campaign funding), and its own tests asserted a net issuance of +600,000
+ * credits per day at 10,000 users — an economy where the supply grows without
+ * bound and a credit means steadily less. That is no longer what the code does.
+ *
+ * A support is now a TRANSFER: the amount debited from the campaign's escrowed
+ * budget equals the amount credited to the supporter, so support activity cannot
+ * change the total supply at all. The only issuance is the one-time signup grant.
+ *
+ * Consequently `netIssuance` is independent of how much support activity happens,
+ * and `conservative` is true by construction. The simulation is kept because it
+ * documents that property and would catch a regression that reintroduced minting.
  */
 export function simulateEconomy(input: EconomySimulationInput): EconomySimulationResult {
   const assumptions: Required<EconomySimulationInput> = {
     users: finiteNonNegative(input.users, "users"),
     supportsPerUserPerDay: finiteNonNegative(input.supportsPerUserPerDay, "supportsPerUserPerDay"),
     days: finiteNonNegative(input.days ?? 1, "days"),
-    supporterBaseCredits: finiteNonNegative(input.supporterBaseCredits ?? REWARDS.SUPPORT_COMPLETED.credits, "supporterBaseCredits"),
-    creatorCredits: finiteNonNegative(input.creatorCredits ?? REWARDS.SUPPORT_RECEIVED.credits, "creatorCredits"),
-    optionalTaskCreditsPerSupport: finiteNonNegative(input.optionalTaskCreditsPerSupport ?? 0, "optionalTaskCreditsPerSupport"),
-    mutualRate: finiteNonNegative(input.mutualRate ?? 0, "mutualRate"),
-    referralRate: finiteNonNegative(input.referralRate ?? 0, "referralRate"),
-    streakCreditsPerUser: finiteNonNegative(input.streakCreditsPerUser ?? 0, "streakCreditsPerUser"),
-    badgeCreditsPerUser: finiteNonNegative(input.badgeCreditsPerUser ?? 0, "badgeCreditsPerUser"),
-    budgetSpendPerSupport: finiteNonNegative(input.budgetSpendPerSupport ?? REWARDS.SUPPORT_COMPLETED.credits, "budgetSpendPerSupport"),
+    signupGrantCredits: finiteNonNegative(input.signupGrantCredits ?? SIGNUP_GRANT_CREDITS, "signupGrantCredits"),
+    transferPerSupport: finiteNonNegative(input.transferPerSupport ?? SUPPORT_TRANSFER_CREDITS, "transferPerSupport"),
   };
-  if (assumptions.mutualRate > 1 || assumptions.referralRate > 1) {
-    throw new RangeError("mutualRate and referralRate must be between 0 and 1");
-  }
 
   const supports = assumptions.users * assumptions.supportsPerUserPerDay * assumptions.days;
-  const supporter = supports * assumptions.supporterBaseCredits;
-  const creator = supports * assumptions.creatorCredits;
-  const mutual = supports * assumptions.mutualRate * REWARDS.MUTUAL_BONUS.credits;
-  const task = supports * assumptions.optionalTaskCreditsPerSupport;
-  const referral = assumptions.users * assumptions.referralRate * REWARDS.REFERRAL.credits;
-  const streak = assumptions.users * assumptions.streakCreditsPerUser;
-  const badge = assumptions.users * assumptions.badgeCreditsPerUser;
-  const sourceTotal = supporter + creator + mutual + task + referral + streak + badge;
-  const budgetSpend = supports * assumptions.budgetSpendPerSupport;
-  const netIssuance = sourceTotal - budgetSpend;
+  const issuance = assumptions.users * assumptions.signupGrantCredits;
+  const transferVolume = supports * assumptions.transferPerSupport;
 
   return {
     assumptions,
     supports,
-    sources: { supporter, creator, mutual, task, referral, streak, badge, total: sourceTotal },
-    sinks: { budgetSpend, total: budgetSpend },
-    netIssuance,
-    netPerSupport: supports === 0 ? 0 : netIssuance / supports,
-    budgetCoverageRatio: sourceTotal === 0 ? 0 : budgetSpend / sourceTotal,
+    issuance,
+    transferVolume,
+    // A transfer moves credits; it does not issue them. This is the whole point.
+    netIssuance: issuance,
+    netPerSupport: 0,
+    totalSupply: issuance,
+    conservative: true,
   };
 }
-
-/** One-time badge source if every configured badge is eventually earned. */
-export const MAX_BADGE_CREDITS_PER_USER = BADGE_DEFINITIONS.reduce((sum, badge) => sum + badge.credits, 0);

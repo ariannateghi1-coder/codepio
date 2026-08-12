@@ -1,5 +1,13 @@
 import { describe, expect, it, beforeEach } from "vitest";
-import { ledgerKey, recordCredit, recordXp, reverseCredit, auditUserBalances } from "@/lib/services/ledger";
+import {
+  auditUserBalances,
+  grantSignupCredits,
+  ledgerKey,
+  recordCredit,
+  recordXp,
+  reverseCredit,
+} from "@/lib/services/ledger";
+import { SIGNUP_GRANT_CREDITS } from "@/lib/gamification";
 import type { Prisma } from "@prisma/client";
 
 /**
@@ -323,5 +331,37 @@ describe("auditUserBalances", () => {
     const audit = await auditUserBalances(fake.tx, "u1");
     expect(audit.consistent).toBe(false);
     expect(audit.credits.drift).toBe(989);
+  });
+});
+
+describe("grantSignupCredits", () => {
+  let fake: ReturnType<typeof createFakeTx>;
+  beforeEach(() => {
+    fake = createFakeTx();
+  });
+
+  it("grants the configured amount through the ledger, not as a bare balance", async () => {
+    const result = await grantSignupCredits(fake.tx, "u1");
+    expect(result.applied).toBe(true);
+    expect(result.balanceAfter).toBe(SIGNUP_GRANT_CREDITS);
+    expect(fake.users.get("u1")!.credits).toBe(SIGNUP_GRANT_CREDITS);
+    // Recorded as an entry, so auditUserBalances stays consistent afterwards.
+    expect(fake.credits).toHaveLength(1);
+    expect(fake.credits[0].type).toBe("SIGNUP_GRANT");
+  });
+
+  it("grants at most once per user, however many times it is called", async () => {
+    // This is what makes it safe to call unconditionally on every registration and
+    // to re-run the backfill migration.
+    for (let i = 0; i < 5; i += 1) await grantSignupCredits(fake.tx, "u1");
+    expect(fake.users.get("u1")!.credits).toBe(SIGNUP_GRANT_CREDITS);
+    expect(fake.credits).toHaveLength(1);
+  });
+
+  it("keeps the cache reconcilable with the ledger", async () => {
+    await grantSignupCredits(fake.tx, "u1");
+    const audit = await auditUserBalances(fake.tx, "u1");
+    expect(audit.consistent).toBe(true);
+    expect(audit.credits.drift).toBe(0);
   });
 });

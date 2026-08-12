@@ -1,6 +1,6 @@
 import { PrismaClient } from "@prisma/client";
 import { hashPassword, referralCode } from "../src/lib/security";
-import { BADGE_DEFINITIONS, BADGE_REQUIREMENTS, REPUTATION } from "../src/lib/gamification";
+import { BADGE_DEFINITIONS, BADGE_REQUIREMENTS, REPUTATION, SIGNUP_GRANT_CREDITS, SUPPORT_TRANSFER_CREDITS } from "../src/lib/gamification";
 
 /**
  * Development seed.
@@ -31,7 +31,8 @@ async function main() {
         description: definition.description,
         icon: definition.icon,
         requirements: requirement,
-        rewardCredits: definition.credits,
+        // Badges pay XP only; a credit reward would have no paying counterparty.
+        rewardCredits: 0,
         rewardXp: definition.xp,
       },
       create: {
@@ -40,7 +41,7 @@ async function main() {
         description: definition.description,
         icon: definition.icon,
         requirements: requirement,
-        rewardCredits: definition.credits,
+        rewardCredits: 0,
         rewardXp: definition.xp,
       },
     });
@@ -77,7 +78,9 @@ async function main() {
         status: "ACTIVE",
         reputation: 120 + number * 40,
         trustScore: 55 + number * 5,
-        credits: number * 15,
+        // Enough to fund the sample campaign below plus the signup grant, written
+        // directly because the seed cannot wait for real supports to happen.
+        credits: SIGNUP_GRANT_CREDITS + SUPPORT_TRANSFER_CREDITS * 20,
         points: number * 90,
         level: Math.min(10, 1 + number),
         supportsCompleted: number * 3,
@@ -115,23 +118,27 @@ async function main() {
         endAt: new Date(Date.now() + 30 * 86_400_000),
         status: "ACTIVE",
         requiredWatchPercent: 90,
-        rewardCredits: 10 + number,
+        // Fixed platform transfer — the same for every campaign by design.
+        rewardCredits: SUPPORT_TRANSFER_CREDITS,
         rewardXp: 25,
         // Written directly rather than through the API, so the seed does not need
         // the creator to have earned credits first. In the real flow a budget is
-        // funded from the creator's own balance (src/lib/services/budget.ts).
-        budgetCredits: 1000,
+        // escrowed from the creator's own balance (src/lib/services/budget.ts).
+        // NOTE: this bypasses the ledger, so a seeded database intentionally shows
+        // budget escrow that has no matching CreditLedger debit.
+        budgetCredits: SUPPORT_TRANSFER_CREDITS * 20,
         maxSupportsPerUser: 1,
         dailyLimit: 100,
         tasks: {
-          // Canonical reward model: required tasks carry no reward of their own —
-          // their value is inside the campaign's rewardCredits. Only the optional
-          // comment task adds a bonus.
+          // Required tasks carry no reward of their own — their value is inside the
+          // campaign transfer. Only the optional comment task adds a bonus, and that
+          // bonus is XP: per-task credits would pay out more than the budget was
+          // charged. rewardCredits is therefore 0 on every task.
           create: [
             { type: "WATCH_VIDEO", required: true, sortOrder: 0, rewardCredits: 0, rewardXp: 0 },
             { type: "SUBSCRIBE_CHANNEL", required: true, sortOrder: 1, rewardCredits: 0, rewardXp: 0 },
             { type: "LIKE_VIDEO", required: true, sortOrder: 2, rewardCredits: 0, rewardXp: 0 },
-            { type: "COMMENT_VIDEO", required: false, sortOrder: 3, rewardCredits: 2, rewardXp: 5 },
+            { type: "COMMENT_VIDEO", required: false, sortOrder: 3, rewardCredits: 0, rewardXp: 5 },
           ],
         },
       },

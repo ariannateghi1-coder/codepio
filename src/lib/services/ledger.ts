@@ -1,6 +1,6 @@
 import "server-only";
 import type { CreditEntryType, Prisma, ReputationEventType, XpEntryType } from "@prisma/client";
-import { calculateLevel, calculateRankTier, REPUTATION } from "../gamification";
+import { calculateLevel, calculateRankTier, REPUTATION, SIGNUP_GRANT_CREDITS } from "../gamification";
 import { BusinessRuleError } from "../errors";
 
 /**
@@ -317,6 +317,33 @@ export async function reverseSessionLedger(tx: Tx, sessionId: string, reason: st
   for (const entry of credits) await reverseCredit(tx, entry.id, reason);
   for (const entry of xp) await reverseXp(tx, entry.id, reason);
   return { creditEntries: credits.length, xpEntries: xp.length };
+}
+
+/**
+ * One-time signup grant — the ONLY place credits enter the system.
+ *
+ * Everything else is a transfer between existing balances (see the CREDIT
+ * CONSERVATION note in src/lib/gamification.ts). Without this, a new account
+ * cannot fund a first campaign and the product loop has no entry point: you need
+ * credits to be supported, and credits come from supporting, which needs someone
+ * else's funded campaign to exist.
+ *
+ * Idempotent per user by construction: the key contains only the user id, so a
+ * retried registration, a replayed request, or a backfill over existing accounts
+ * all collapse to a single grant. Safe to call unconditionally.
+ */
+export async function grantSignupCredits(tx: Tx, userId: string): Promise<CreditResult> {
+  if (SIGNUP_GRANT_CREDITS <= 0) {
+    const user = await tx.user.findUniqueOrThrow({ where: { id: userId }, select: { credits: true } });
+    return { applied: false, balanceAfter: user.credits };
+  }
+  return recordCredit(tx, {
+    userId,
+    type: "SIGNUP_GRANT",
+    amount: SIGNUP_GRANT_CREDITS,
+    idempotencyKey: ledgerKey(["signup-grant", userId]),
+    reason: "one-time signup grant",
+  });
 }
 
 /**

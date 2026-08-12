@@ -35,7 +35,6 @@ const getBadgeCatalogue = unstable_cache(
         name: true,
         description: true,
         icon: true,
-        rewardCredits: true,
         rewardXp: true,
         _count: { select: { users: true } },
       },
@@ -49,7 +48,7 @@ export default async function BadgesPage() {
 
   return (
     <AppShell>
-      <PageHeader title="نشان‌ها" description="هر نشان از تاریخچه واقعی حمایت‌ها محاسبه می‌شود و پاداش آن در دفتر حساب ثبت می‌گردد." />
+      <PageHeader title="نشان‌ها" description="هر نشان از تاریخچه واقعی حمایت‌ها محاسبه می‌شود و پاداش آن به‌صورت XP در دفتر حساب ثبت می‌گردد." />
 
       {badges.length === 0 ? (
         <EmptyState title="نشانی تعریف نشده" description="فهرست نشان‌ها هنوز مقداردهی نشده است." />
@@ -64,13 +63,10 @@ export default async function BadgesPage() {
                 <h2 className="text-sm font-bold">{badge.name}</h2>
                 <p className="mt-1.5 flex-1 text-sm leading-7 text-fg-muted">{badge.description}</p>
                 <div className="mt-4 flex flex-wrap items-center gap-2">
-                  {badge.rewardCredits > 0 && (
-                    <Pill tone="accent" className="numeric">
-                      +{formatNumber(badge.rewardCredits)} اعتبار
-                    </Pill>
-                  )}
+                  {/* XP only: badges have no paying counterparty, so a credit reward
+                      would mint currency. See CREDIT CONSERVATION in gamification.ts. */}
                   {badge.rewardXp > 0 && (
-                    <Pill className="numeric">+{formatNumber(badge.rewardXp)} XP</Pill>
+                    <Pill tone="accent" className="numeric">+{formatNumber(badge.rewardXp)} XP</Pill>
                   )}
                   <span className="numeric ms-auto text-xs text-fg-subtle">
                     {formatNumber(badge._count.users)} نفر
