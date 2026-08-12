@@ -16,6 +16,21 @@ function devDefault<T extends z.ZodTypeAny>(schema: T, fallback: z.input<T>) {
   return isProd ? schema : schema.default(fallback as never);
 }
 
+/**
+ * The deployment's own public URL, as reported by the host platform.
+ *
+ * Netlify sets DEPLOY_PRIME_URL to the URL this specific deploy is reachable at
+ * (the branch or preview URL) and URL to the site's primary address; on a
+ * production deploy the two are the same. DEPLOY_PRIME_URL is preferred so a
+ * deploy preview links to itself instead of to production.
+ *
+ * This is a fallback, not an override: an explicit NEXT_PUBLIC_APP_URL always
+ * wins, which is what a custom domain needs. Unlike a secret, guessing this
+ * value wrong is self-correcting and visible, so deriving it is safe — whereas
+ * failing the build over a value the platform already knows is not.
+ */
+const platformUrl = process.env.DEPLOY_PRIME_URL || process.env.URL;
+
 const schema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
 
@@ -30,7 +45,16 @@ const schema = z.object({
     "development-session-secret-change-me-32chars"
   ),
 
-  NEXT_PUBLIC_APP_URL: devDefault(z.string().url(), "http://localhost:3000"),
+  /**
+   * Absolute public origin. Used for canonical metadata, the sitemap, the
+   * OAuth redirect URI and the same-origin check, so it must be the address
+   * users actually reach the app at.
+   */
+  NEXT_PUBLIC_APP_URL: isProd
+    ? platformUrl
+      ? z.string().url().default(platformUrl)
+      : z.string().url()
+    : z.string().url().default("http://localhost:3000"),
 
   /**
    * Number of proxy hops we trust in x-forwarded-for. 0 = trust nothing and use
