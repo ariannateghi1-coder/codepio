@@ -8,6 +8,7 @@ import { Button } from "@/components/ui/button";
 import { Alert } from "@/components/ui/states";
 import { ProgressBar, Steps, type Step } from "@/components/ui/progress";
 import { Pill, VerificationBadge } from "@/components/ui/badge";
+import { ComplianceBanner } from "./compliance-banner";
 import { formatDuration, formatNumber } from "@/lib/cn";
 import { SUPPORT_TRANSFER_CREDITS } from "@/lib/gamification";
 import { youtubeAppUrl } from "@/lib/youtube";
@@ -171,6 +172,15 @@ export function SupportFlow({
   const [verifying, setVerifying] = useState(false);
   const [completion, setCompletion] = useState<Completion | null>(null);
   const [completing, setCompleting] = useState(false);
+  /**
+   * Bumped to re-run the start effect.
+   *
+   * A counter rather than calling the start logic directly: the session request
+   * lives inside an effect with its own cancellation, so re-triggering the effect
+   * reuses that teardown instead of introducing a second, racier start path.
+   */
+  const [startNonce, setStartNonce] = useState(0);
+  const restart = useCallback(() => setStartNonce((n) => n + 1), []);
 
   const tickRef = useRef<number | null>(null);
 
@@ -216,7 +226,7 @@ export function SupportFlow({
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, campaignId]);
+  }, [open, campaignId, startNonce]);
 
   // Cosmetic countdown. It never decides anything — when it reaches zero the
   // server is asked, and the server's answer replaces whatever this showed.
@@ -420,6 +430,19 @@ export function SupportFlow({
         )
       }
     >
+      {/*
+        Compliance first. A violated user is refused by the server the moment they
+        open this flow, so the banner explains WHY the session failed to start and
+        offers the way out, instead of leaving a bare rule error on screen. Renders
+        nothing when the user is compliant, and costs no YouTube quota to show.
+
+        onRestored re-runs the flow: once the gate lifts, the session the user
+        originally asked for can actually be created.
+      */}
+      <div className="mb-4">
+        <ComplianceBanner onRestored={restart} />
+      </div>
+
       {error && (
         <Alert tone="danger" live="alert" className="mb-4">
           {error}

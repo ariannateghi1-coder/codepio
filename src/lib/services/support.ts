@@ -24,6 +24,7 @@ import {
 import { assertRewardTransition, isTerminal, nextState } from "./support-state";
 import { computeSettlement, defaultTaskBonus, settlementBreakdown } from "./reward";
 import { checkComment, checkLike, checkSubscription } from "./youtube-api";
+import { assertCompliant, recordComplianceObligation } from "./subscription-compliance";
 import { createNotificationTx, deliverNotification } from "./notifications";
 import { campaignAvailabilityFailure } from "./campaign-eligibility";
 import { evaluateBadges } from "./badges";
@@ -95,6 +96,8 @@ const RULE_MESSAGES: Record<string, string> = {
   IMPOSSIBLE_TIMELINE: "زمان سپری‌شده با میزان تماشای گزارش‌شده هم‌خوانی ندارد.",
   REQUIRED_TASK_INCOMPLETE: "همه کارهای الزامی انجام نشده‌اند.",
   RISK_DENIED: "این حمایت به دلیل رفتار مشکوک تأیید نشد.",
+  SUBSCRIPTION_COMPLIANCE_VIOLATED:
+    "برای ادامه فعالیت، باید اشتراک کانال‌هایی که بابت آن‌ها حمایت دریافت کرده‌اید را حفظ کنید. ابتدا دوباره کانال را سابسکرایب کنید و سپس بررسی مجدد را انجام دهید.",
   ALREADY_SUPPORTED_PAIR: "در بازه خنک‌سازی این سازنده هستید.",
 };
 
@@ -228,6 +231,16 @@ export type StartSupportResult = {
 };
 
 export async function startSupportSession(input: StartSupportInput): Promise<StartSupportResult> {
+  // Subscription compliance is checked BEFORE the transaction opens, never inside
+  // it. The check can reach YouTube, and this transaction also runs the whole
+  // eligibility pass — holding it open across an 8-second provider timeout would
+  // tie up a pooled connection for the duration. Same sequencing as
+  // verifySessionTasks: talk to the provider first, then write.
+  //
+  // Placed at the very start so a blocked user is refused before any row is
+  // created, and the error they get names the actual reason.
+  await assertCompliant(input.supporterId);
+
   return prisma.$transaction(async (tx) => {
     const { campaign } = await assertEligible(tx, { supporterId: input.supporterId, campaignId: input.campaignId });
 
@@ -700,6 +713,13 @@ export async function completeSupportSession(input: {
   sessionId: string;
   supporterId: string;
 }): Promise<CompleteSupportResult> {
+  // Same reasoning as startSupportSession: outside the transaction, because the
+  // settlement transaction is Serializable and must not wait on YouTube.
+  //
+  // Checked here too, not only at start: a session can be started while compliant
+  // and completed an hour later, and settlement is where the money actually moves.
+  await assertCompliant(input.supporterId);
+
   const MAX_ATTEMPTS = 4;
   let lastError: unknown;
 
@@ -991,6 +1011,36 @@ async function runCompletion(input: { sessionId: string; supporterId: string }) 
 
       const targetRewardState = combined.decision === "REVIEW" ? "PENDING_REVIEW" : "CONFIRMED";
       assertRewardTransition(session.rewardState, targetRewardState);
+
+      // ---- Subscription obligation ----------------------------------------
+      // Recorded inside the settlement transaction, so an obligation can never be
+      // missing for a support that was paid, nor exist for one that rolled back.
+      //
+      // The channel is read here rather than passed in because the obligation is to
+      // the channel that was actually supported: copying it now means a creator who
+      // later links a different channel cannot silently move or void everyone's
+      // obligation.
+      //
+      // `subscriptionVerified` comes from the task row's own state — SATISFIED with
+      // method YOUTUBE_API is the only combination that means YouTube itself
+      // confirmed it. A PLATFORM_OBSERVED or SELF_REPORTED pass is deliberately not
+      // enough to create an enforceable obligation: it would be unfair to block
+      // someone later over a subscription we never actually verified.
+      const subscribeTask = session.tasks.find((task) => task.type === "SUBSCRIBE_CHANNEL");
+      const creatorChannel = subscribeTask
+        ? await tx.youtubeConnection.findUnique({
+            where: { userId: session.creatorId },
+            select: { channelId: true },
+          })
+        : null;
+
+      await recordComplianceObligation(tx, {
+        userId: input.supporterId,
+        supportId: support.id,
+        targetChannelId: creatorChannel?.channelId ?? null,
+        subscriptionRequired: Boolean(subscribeTask?.required),
+        subscriptionVerified: subscribeTask?.state === "SATISFIED" && subscribeTask.method === "YOUTUBE_API",
+      });
 
       await tx.supportSession.update({
         where: { id: session.id },
@@ -1316,6 +1366,21 @@ export async function resolveHeldReward(input: {
   reason?: string;
 }) {
   const reason = input.reason?.slice(0, 500) ?? "";
+
+  // A held reward is new credit about to be paid, so it is gated like any other
+  // earning: approving one for a supporter who has since unsubscribed would pay
+  // out precisely the behaviour compliance exists to discourage.
+  //
+  // Only the APPROVE path is gated. A REFUSE must always be able to proceed — it
+  // returns the amount to the campaign budget, and leaving held rewards stuck
+  // because the supporter is non-compliant would penalize the creator instead.
+  if (input.decision === "APPROVE") {
+    const held = await prisma.supportSession.findUnique({
+      where: { id: input.sessionId },
+      select: { supporterId: true },
+    });
+    if (held) await assertCompliant(held.supporterId);
+  }
 
   const result = await prisma.$transaction(async (tx) => {
     const session = await tx.supportSession.findUnique({

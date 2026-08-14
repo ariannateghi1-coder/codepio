@@ -108,6 +108,18 @@ const schema = z.object({
   GOOGLE_CLIENT_SECRET: z.string().optional(),
   YOUTUBE_API_KEY: z.string().optional(),
 
+  /**
+   * Daily YouTube Data API quota, in units. Google's default for a new project is
+   * 10,000/day, reset at midnight Pacific.
+   *
+   * Configurable rather than hard-coded because a project with an approved quota
+   * increase has a genuinely different budget, and the subscription-compliance
+   * sweep sizes its own spend as a fraction of this number. Setting it too high
+   * does not create quota — it only makes the sweep keep working until Google
+   * starts answering 403, which callers already treat as a temporary error rather
+   * than a failed verification.
+   */
+  YOUTUBE_DAILY_QUOTA: z.coerce.number().int().min(1_000).default(10_000),
 
   LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default(isProd ? "info" : "debug"),
 });

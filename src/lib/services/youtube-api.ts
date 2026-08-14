@@ -5,6 +5,7 @@ import { env, features } from "../env";
 import { logger } from "../logger";
 import { UpstreamError, internalMessage } from "../errors";
 import { encryptSecret, decryptSecret } from "../crypto";
+import { QUOTA_COST, recordQuotaSpend } from "./youtube-quota";
 import { parseIsoDuration, isValidYoutubeChannelId, isValidYoutubeVideoId } from "../youtube";
 
 /**
@@ -539,6 +540,7 @@ export async function checkSubscription(userId: string, channelId: string): Prom
 
   try {
     type Response = { items?: { id: string }[]; pageInfo?: { totalResults: number } };
+    await recordQuotaSpend(QUOTA_COST.subscriptionsList);
     const data = await apiGet<Response>(
       "subscriptions",
       { part: "snippet", forChannelId: channelId, mine: "true", maxResults: "1" },
@@ -553,6 +555,85 @@ export async function checkSubscription(userId: string, channelId: string): Prom
     };
   } catch (e) {
     return await apiFailureToCheck(userId, e, { channelId });
+  }
+}
+
+/**
+ * Is `userId` subscribed to EACH of `channelIds`?
+ *
+ * THE ONE REAL BATCHING WIN AVAILABLE HERE
+ * `subscriptions.list` accepts a comma-separated `forChannelId`, and the call
+ * costs 1 quota unit no matter how many channels are listed. So a supporter with
+ * six outstanding obligations is answered for 1 unit instead of 6.
+ *
+ * WHAT CANNOT BE BATCHED, STATED PLAINLY
+ * Users. Every call is signed with that user's own OAuth token, so no request
+ * shape answers for two people. The cost of compliance is therefore one unit per
+ * user per TTL window — batching helps within a user and not across them, and any
+ * capacity planning that assumes otherwise is wrong.
+ *
+ * FAILURE SEMANTICS
+ * All-or-nothing. On failure the verdict applies to every channel asked about,
+ * because a partial answer is indistinguishable from "subscribed to some": the
+ * API returns only matches, so a missing tail looks identical whether the user is
+ * not subscribed or the request died early. Marking a subset NOT_VERIFIED off a
+ * failed call is precisely how an outage becomes a wave of false violations.
+ *
+ * `maxResults` follows the number of channels asked about rather than being
+ * pinned at 1, since a truncated page would silently read as "not subscribed"
+ * for everything past the cut.
+ */
+export async function checkSubscriptions(
+  userId: string,
+  channelIds: string[]
+): Promise<{ outcome: CheckOutcome; available: boolean; subscribed: Set<string>; detail?: Record<string, unknown> }> {
+  const unique = [...new Set(channelIds.filter(Boolean))];
+  if (unique.length === 0) {
+    return { outcome: "VERIFIED", available: true, subscribed: new Set() };
+  }
+
+  const token = await getAccessToken(userId);
+  if (!token.ok) {
+    const failure = checkFromTokenFailure(token);
+    return { outcome: failure.outcome, available: false, subscribed: new Set(), detail: failure.detail };
+  }
+
+  try {
+    type Response = {
+      items?: { snippet?: { resourceId?: { channelId?: string } } }[];
+      pageInfo?: { totalResults: number };
+    };
+    await recordQuotaSpend(QUOTA_COST.subscriptionsList);
+    const data = await apiGet<Response>(
+      "subscriptions",
+      {
+        part: "snippet",
+        forChannelId: unique.join(","),
+        mine: "true",
+        maxResults: String(Math.min(50, Math.max(1, unique.length))),
+      },
+      { accessToken: token.accessToken }
+    );
+
+    // Built from the resource ids the API returned, intersected with what was
+    // asked. An unexpected extra item therefore cannot mark an unrelated
+    // obligation satisfied.
+    const asked = new Set(unique);
+    const subscribed = new Set<string>();
+    for (const item of data.items ?? []) {
+      const id = item.snippet?.resourceId?.channelId;
+      if (id && asked.has(id)) subscribed.add(id);
+    }
+
+    return {
+      outcome: "VERIFIED",
+      available: true,
+      subscribed,
+      detail: { asked: unique.length, matched: subscribed.size, totalResults: data.pageInfo?.totalResults ?? 0 },
+    };
+  } catch (e) {
+    const failure = await apiFailureToCheck(userId, e, { channels: unique.length });
+    return { outcome: failure.outcome, available: false, subscribed: new Set(), detail: failure.detail };
   }
 }
 

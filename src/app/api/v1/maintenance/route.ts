@@ -5,6 +5,7 @@ import { UnauthorizedError } from "@/lib/errors";
 import { purgeExpiredSessions } from "@/lib/security";
 import { purgeExpiredRateLimits } from "@/lib/rate-limit";
 import { expireStaleSessions } from "@/lib/services/support";
+import { runComplianceSweep } from "@/lib/services/subscription-compliance";
 import { snapshotLeaderboard } from "@/lib/services/leaderboard";
 import { runRetention } from "@/lib/services/retention";
 import { prisma } from "@/lib/prisma";
@@ -66,6 +67,16 @@ export const POST = route("maintenance.run", async (req) => {
     snapshotLeaderboard("MONTHLY", "TOP_SUPPORTERS"),
   ]);
 
+  // Subscription compliance sweep. Runs sequentially and AFTER the cleanup above
+  // for two reasons: it is the only step that talks to an external provider, so it
+  // must not delay local cleanup if YouTube is slow; and it is self-limiting (a
+  // hard user cap per run plus a quota ceiling), so a large backlog drains over
+  // several runs instead of in one burst.
+  //
+  // A dry run skips it: there is no read-only version of "ask YouTube", and
+  // spending quota during a dry run would contradict the flag's whole purpose.
+  const compliance = options.dryRun ? null : await runComplianceSweep();
+
   // Retention runs LAST and sequentially, after the snapshots above. Order matters:
   // snapshotLeaderboard() reads period aggregates, and running it after a large
   // delete pass would have it compete for I/O with the cleanup for no benefit.
@@ -84,6 +95,7 @@ export const POST = route("maintenance.run", async (req) => {
     closedSupportSessions: staleSupport,
     purgedTokens: tokens.reduce((sum, r) => sum + r.count, 0),
     leaderboardRows: snapshots.reduce((a, b) => a + b, 0),
+    compliance,
     retention,
   };
 

@@ -12,6 +12,7 @@ import { ProgressBar } from "@/components/ui/progress";
 import { Alert, EmptyState, ErrorState, SkeletonCard } from "@/components/ui/states";
 import { ExploreCard, type ExploreCardData } from "./cards";
 import { SupportFlow } from "./support-flow";
+import { ComplianceBanner } from "./compliance-banner";
 import { formatNumber, formatRelativeTime } from "@/lib/cn";
 import { rankTierLabel } from "@/lib/gamification";
 import type { RankTier } from "@prisma/client";
@@ -122,6 +123,20 @@ export function DashboardView() {
 
   return (
     <div>
+      {/*
+        Subscription compliance, ABOVE everything else: while it is violated the
+        user cannot start a support at all, so burying it under the stats would
+        leave them clicking «شروع حمایت» into an error with no explanation.
+        Renders nothing when there is nothing wrong, and costs no YouTube quota to
+        display — see compliance-banner.tsx.
+
+        onRestored reloads the dashboard because a restore changes what the user
+        may do next, and the figures here should reflect it immediately.
+      */}
+      <div className="mb-6">
+        <ComplianceBanner onRestored={load} />
+      </div>
+
       {/* Level + progress: the single most important status block. */}
       <Card variant="raised" className="mb-6 p-5 sm:p-6">
         <div className="flex flex-wrap items-start justify-between gap-4">
@@ -240,7 +255,7 @@ export function DashboardView() {
 
       <Section
         title="پیشنهاد برای شما"
-        description="بر اساس اعتبار، تازگی و تنوع انتخاب شده‌اند."
+        description="بر اساس اعتبار، تازگی و ت��وع انتخاب شده‌اند."
         actions={
           <Link href="/explore" className="text-sm font-bold text-accent">
             همه کاوش
@@ -273,7 +288,7 @@ export function DashboardView() {
             <EmptyState
               title="کمپین فعالی ندارید"
               description="یک ویدیو اضافه کنید و کمپین بسازید تا در کاوش دیده شود."
-              action={{ label: "ساخت کمپین", href: "/studio" }}
+              action={{ label: "ساخت کم��ین", href: "/studio" }}
             />
           ) : (
             <div className="space-y-3">

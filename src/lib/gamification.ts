@@ -280,6 +280,73 @@ export const WATCH_RULES = {
   sessionTtlMinutes: 90,
 } as const;
 
+/**
+ * Subscription-compliance rules.
+ *
+ * A supporter who is paid for subscribing must keep that subscription. Every
+ * number here exists to make that enforceable WITHOUT spending YouTube quota
+ * carelessly, because the quota is the binding constraint on the whole feature.
+ *
+ * THE ARITHMETIC BEHIND `verificationTtlMinutes`
+ *   One check costs 1 quota unit and covers every obligation a single user has
+ *   (subscriptions.list accepts a comma-separated forChannelId list, so one call
+ *   answers up to `maxChannelsPerCall` channels at once). It CANNOT be batched
+ *   across users: each call is signed with that user's own OAuth token, so there
+ *   is no request shape that answers for two people. The cost is therefore
+ *   one unit per active user per TTL window, and nothing else.
+ *
+ *   At a 10,000 unit/day default and a 12-hour TTL that is 2 checks per user per
+ *   day, so ~5,000 active users fit inside the daily allowance with the rest of
+ *   the app's usage (video metadata, subscribe/like verification during sessions)
+ *   still funded. Shortening the TTL is the expensive knob: 1 hour would mean 24
+ *   checks per user per day and would exhaust the quota at ~400 users.
+ *
+ * WHY A TTL AT ALL
+ *   Without it, a dashboard refresh would cost a quota unit and a user holding
+ *   the page open would drain the day's allowance alone. A cached verdict inside
+ *   the window is reused for reads, and only a sensitive operation may force a
+ *   live call once the window has passed.
+ */
+export const COMPLIANCE_RULES = {
+  /**
+   * How long a verification stays authoritative. Reads inside this window never
+   * touch the API; sensitive operations past it force one live check.
+   */
+  verificationTtlMinutes: 12 * 60,
+  /**
+   * Channels per subscriptions.list call. The API allows maxResults up to 50; 40
+   * leaves headroom so a user with many obligations cannot silently have the
+   * tail of the list truncated, which would read as "not subscribed".
+   */
+  maxChannelsPerCall: 40,
+  /** First retry delay after a failed check. Doubles per consecutive failure. */
+  backoffBaseMinutes: 15,
+  /** Ceiling for the backoff, so a long outage still retries twice a day. */
+  backoffMaxMinutes: 8 * 60,
+  /**
+   * Users examined per background sweep run. With the maintenance cron at every
+   * 15 minutes this bounds the sweep at 160 units/hour worst case, which is why
+   * a backlog drains gradually instead of in one quota-exhausting burst.
+   */
+  sweepMaxUsersPerRun: 40,
+  /**
+   * A user with no activity for this many days is not swept. They cannot start a
+   * support without being checked at that moment anyway, so checking them in the
+   * background buys nothing and spends quota that active users need.
+   */
+  inactiveDays: 30,
+  /**
+   * Share of the daily quota the BACKGROUND sweep may consume. Past this it stops
+   * and waits for the next run.
+   *
+   * The asymmetry is deliberate: a user-initiated action (starting a support,
+   * pressing «بررسی مجدد») may spend up to the full budget, because refusing it
+   * would either block a legitimate support or leave someone unable to prove they
+   * re-subscribed. Only the discretionary background work yields.
+   */
+  sweepQuotaFraction: 0.5,
+} as const;
+
 /** Risk thresholds mapping a session's risk score to a reward decision. */
 export const RISK_THRESHOLDS = {
   /**
