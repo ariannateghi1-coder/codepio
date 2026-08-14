@@ -5,6 +5,9 @@ import { assertCsrf, createSession, hashPassword, requireSession, revokeAllSessi
 import { enforceRateLimit } from "@/lib/rate-limit";
 import { AppError } from "@/lib/errors";
 import { writeAudit } from "@/lib/audit";
+import { sendMail } from "@/lib/mailer";
+import { passwordChangedEmail } from "@/lib/emails";
+import { logger } from "@/lib/logger";
 
 /**
  * Change password (authenticated).
@@ -34,9 +37,12 @@ export const POST = route("auth.changePassword", async (req) => {
   await createSession(user.id, req);
 
   await writeAudit({ userId: user.id, action: "SECURITY", entity: "PasswordChange", entityId: user.id, req, metadata: { outcome: "COMPLETED" } });
-  // NOTE: no email provider is wired into this project yet (see src/lib/env.ts),
-  // so there is nothing to actually send a "password changed" notice through.
-  // Once an email service is added, send it here.
+  // Notify out-of-band. Not awaited: the password is already changed, so a mail
+  // provider outage must not turn a completed operation into a 500. This is how
+  // the owner finds out if someone else changed their password.
+  void sendMail({ to: user.email, ...passwordChangedEmail({ name: user.name }) }).catch((e) =>
+    logger.error("password changed notice failed", { userId: user.id, error: e })
+  );
 
   return ok({ message: "رمز عبور شما تغییر کرد و سایر نشست‌ها بسته شدند." });
 });

@@ -97,6 +97,31 @@ export const loginSchema = z.object({
   password: z.string().min(1).max(200),
 });
 
+export const forgotPasswordSchema = z.object({
+  email: emailSchema,
+});
+
+/**
+ * Reset submission.
+ *
+ * The token is bounded but otherwise unvalidated in shape: it is compared against
+ * a stored hash, so a malformed value simply fails to match. Rejecting it on
+ * format here would only add a second, differently-timed failure path.
+ *
+ * The new password goes through the same passwordSchema as registration — a reset
+ * must not be a way to set a weaker password than signup allows.
+ */
+export const resetPasswordSchema = z
+  .object({
+    token: z.string().trim().min(20).max(200),
+    password: passwordSchema,
+    confirmPassword: z.string(),
+  })
+  .refine((v) => v.password === v.confirmPassword, {
+    path: ["confirmPassword"],
+    message: "تکرار رمز عبور مطابقت ندارد.",
+  });
+
 export const changePasswordSchema = z
   .object({
     currentPassword: z.string().min(1).max(200),
