@@ -88,7 +88,7 @@ export const POST = active(
     // watch verification is meaningless without a real duration from the API.
     const video = await prisma.video.findFirst({
       where: { id: data.videoId, userId: user.id, status: "ACTIVE" },
-      select: { id: true, durationSec: true },
+      select: { id: true, durationSec: true, madeForKids: true },
     });
     if (!video) throw new NotFoundError("این ویدیو در حساب شما پیدا نشد.");
     if (!video.durationSec) {
@@ -120,6 +120,11 @@ export const POST = active(
           maxSupportsPerUser: data.maxSupportsPerUser ?? null,
           dailyLimit: data.dailyLimit ?? null,
           minAccountAgeHours: data.minAccountAgeHours,
+          // Declared by the creator, and forced on when YouTube itself reports the
+          // video as kids content: there the like is provably unverifiable, so
+          // running without the waiver would keep failing honest supporters no
+          // matter what the creator ticked.
+          kidsContent: data.kidsContent || video.madeForKids === true,
           tasks: {
             create: data.tasks.map((task, index) => ({
               type: task.type,

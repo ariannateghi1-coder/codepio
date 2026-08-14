@@ -49,7 +49,13 @@ export const GET = route("youtube.oauth.callback", async (req) => {
   // Google's token endpoint over TLS).
   const googleSub = decodeIdTokenSub(tokens.id_token) ?? `unknown:${user.id}`;
 
-  await storeOAuthGrant({ userId: user.id, googleSub, tokens });
+  // The email is stored alongside the grant so every later "not verified" can name
+  // the account it inspected. Users recognise their email; they do not recognise a
+  // channel id, and with two Google accounts signed in that name is the only clue
+  // that the subscribe landed somewhere we cannot read.
+  const googleEmail = decodeIdTokenEmail(tokens.id_token);
+
+  await storeOAuthGrant({ userId: user.id, googleSub, googleEmail, tokens });
 
   const channel = await fetchOwnChannel(user.id);
   if (!channel) return redirect("no_channel");
@@ -107,6 +113,17 @@ export const GET = route("youtube.oauth.callback", async (req) => {
 
   return redirect("connected");
 });
+
+function decodeIdTokenEmail(idToken?: string): string | null {
+  const payload = idToken?.split(".")[1];
+  if (!payload) return null;
+  try {
+    const json = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")) as { email?: string };
+    return json.email ?? null;
+  } catch {
+    return null;
+  }
+}
 
 function decodeIdTokenSub(idToken?: string): string | null {
   if (!idToken) return null;

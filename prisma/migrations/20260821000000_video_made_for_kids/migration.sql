@@ -1,0 +1,17 @@
+-- YouTube's "Made for Kids" flag on campaign videos.
+--
+-- WHY THIS EXISTS
+-- On kids content YouTube turns personalisation off. Comments are hard disabled
+-- (commentThreads answers 403 commentsDisabled), and a like is not reliably
+-- reflected in the viewer's own "Liked videos" playlist — which is the ONLY like
+-- surface a youtube.readonly grant can read. videos.getRating, the direct answer,
+-- requires the full read/write youtube scope and refuses a read-only token.
+--
+-- The observable consequence in production: a campaign video with 2 public likes,
+-- while neither connected account's liked list contained it. Supporters were told
+-- "you did not like this video" and re-checking could never clear it.
+--
+-- Storing the flag lets the product state the limitation instead of blaming the
+-- supporter. Additive and nullable; existing rows are backfilled from videos.list
+-- on their next metadata sync.
+ALTER TABLE "Video" ADD COLUMN IF NOT EXISTS "madeForKids" BOOLEAN;

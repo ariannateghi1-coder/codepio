@@ -452,6 +452,13 @@ model YoutubeAccount {
   id                 String                 @id @default(cuid())
   userId             String                 @unique
   googleSub          String                 @unique
+  /// The Google account this grant belongs to.
+  ///
+  /// Kept so the UI can name the identity being inspected. When someone is signed
+  /// into several Google accounts, a genuine subscribe or like lands on an account
+  /// this grant cannot read, and "not verified" is indistinguishable from a bug
+  /// unless we can say WHICH account we checked.
+  googleEmail        String?
   channelId          String?
   scope              String
   accessTokenCipher  String
@@ -483,6 +490,26 @@ model Video {
   description      String?
   thumbnailUrl     String?
   durationSec      Int?
+  /// The channel that actually OWNS this video on YouTube, captured from
+  /// videos.list when the video is registered or re-synced.
+  ///
+  /// This — not the uploader's linked account — is the channel a supporter is
+  /// asked to subscribe to and the one the subscribe check runs against. Video
+  /// ownership is public, so the target stays knowable even for a creator who
+  /// never connected OAuth; reading the target from YoutubeConnection instead
+  /// left those campaigns with no target at all, and an honest supporter was told
+  /// they had not subscribed.
+  channelId        String?
+  channelTitle     String?
+  /// YouTube's "Made for Kids" flag, captured with the rest of the metadata.
+  ///
+  /// On this content YouTube switches personalisation features off: comments are
+  /// hard disabled, and a like is not reliably reflected in the viewer's own
+  /// "Liked videos" list — the only surface a read-only grant can read. The like
+  /// task is therefore UNVERIFIABLE here whatever scope we hold, so the product
+  /// says so up front instead of telling supporters they did not like a video
+  /// they really liked.
+  madeForKids      Boolean?
   metadataSyncedAt DateTime?
   status           VideoStatus      @default(ACTIVE)
   createdAt        DateTime         @default(now())
@@ -495,6 +522,7 @@ model Video {
   @@unique([userId, youtubeVideoId])
   @@index([youtubeVideoId])
   @@index([userId, status])
+  @@index([channelId])
   @@index([status, createdAt(sort: Desc)])
 }
 
@@ -535,6 +563,25 @@ model Campaign {
   /// so historical campaigns still show the percentage they ran under; nothing
   /// reads it to decide a current requirement.
   requiredWatchPercent Int  @default(99)
+
+  /// The creator declares this campaign as kids content, waiving API verification
+  /// of subscribe and like.
+  ///
+  /// On videos and channels flagged "Made for Kids" YouTube switches
+  /// personalisation off: comments are hard disabled and the like never reaches
+  /// the viewer's own "Liked videos" playlist, which is the only like surface a
+  /// read-only grant can read. Creators report the same about subscriptions to
+  /// such channels; we could not confirm that from the API either way, and that
+  /// uncertainty is precisely why this is a DECLARATION rather than a detection.
+  ///
+  /// When set, subscribe and like are recorded as WAIVED — never FAILED. Demanding
+  /// that the creator un-flag their video was the wrong fix: it asks them to break
+  /// their own YouTube compliance to satisfy our checker.
+  ///
+  /// The trade is stated in the UI and falls on the creator alone: they pay the
+  /// same budget for supports whose subscribe and like nobody can prove. It cannot
+  /// be used to cheat supporters, only to buy weaker evidence.
+  kidsContent Boolean @default(false)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt

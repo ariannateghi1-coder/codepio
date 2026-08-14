@@ -196,6 +196,15 @@ export const campaignCreateSchema = z
     maxSupportsPerUser: z.coerce.number().int().min(1).max(100).optional().nullable(),
     dailyLimit: z.coerce.number().int().min(1).max(10_000).optional().nullable(),
     minAccountAgeHours: z.coerce.number().int().min(0).max(720).default(0),
+    /**
+     * Creator declaration: this is kids content, so subscribe and like cannot be
+     * verified through the YouTube API and are waived instead of failed.
+     *
+     * Accepted from the client — unlike reward or watch settings — because it only
+     * ever WEAKENS the evidence the creator gets for their own budget. There is no
+     * incentive to set it falsely and no way to use it against a supporter.
+     */
+    kidsContent: z.coerce.boolean().default(false),
     tasks: z
       .array(
         z.object({

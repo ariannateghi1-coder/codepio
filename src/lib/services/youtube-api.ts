@@ -242,16 +242,19 @@ async function bumpFailure(userId: string, code: string): Promise<number> {
 export async function youtubeConnectionState(userId: string): Promise<{
   state: YoutubeConnectionState;
   channelId: string | null;
+  /** The Google account the checks will run against, when known. */
+  googleEmail: string | null;
   lastErrorCode: string | null;
 }> {
   const account = await prisma.youtubeAccount.findUnique({
     where: { userId },
-    select: { state: true, channelId: true, revokedAt: true, lastErrorCode: true },
+    select: { state: true, channelId: true, googleEmail: true, revokedAt: true, lastErrorCode: true },
   });
-  if (!account) return { state: "DISCONNECTED", channelId: null, lastErrorCode: null };
+  if (!account) return { state: "DISCONNECTED", channelId: null, googleEmail: null, lastErrorCode: null };
   return {
     state: account.revokedAt && account.state === "CONNECTED" ? "DISCONNECTED" : account.state,
     channelId: account.channelId,
+    googleEmail: account.googleEmail,
     lastErrorCode: account.lastErrorCode,
   };
 }
@@ -259,11 +262,22 @@ export async function youtubeConnectionState(userId: string): Promise<{
 export async function storeOAuthGrant(input: {
   userId: string;
   googleSub: string;
+  /**
+   * The Google account this grant belongs to.
+   *
+   * Stored so the product can NAME the identity it inspects. A user with several
+   * Google accounts — the browser on one, the YouTube app on another — performs a
+   * real subscribe or like that this grant cannot see, and a bare "not verified"
+   * gives them no way to discover that. The channel title alone is not enough:
+   * people recognise their email, not their channel id.
+   */
+  googleEmail?: string | null;
   tokens: TokenResponse;
   channelId?: string | null;
 }) {
   const data = {
     googleSub: input.googleSub,
+    ...(input.googleEmail ? { googleEmail: input.googleEmail } : {}),
     scope: input.tokens.scope,
     accessTokenCipher: encryptSecret(input.tokens.access_token),
     accessTokenExpires: new Date(Date.now() + input.tokens.expires_in * 1000),
@@ -373,6 +387,16 @@ export type VideoMetadata = {
   durationSec: number | null;
   embeddable: boolean;
   privacyStatus: string;
+  /**
+   * True when YouTube applies its kids restrictions to this video — set by the
+   * video's own flag OR by its channel's.
+   *
+   * Decides whether subscribe and like are verifiable at all. On kids content the
+   * like does not appear in the viewer's own "Liked videos" playlist, which is the
+   * only like surface a read-only grant can read, and subscriptions behave the same
+   * way as far as we can tell from outside.
+   */
+  madeForKids: boolean;
 };
 
 /** Authoritative metadata straight from YouTube — never trusted from the client. */
@@ -391,7 +415,7 @@ export async function fetchVideoMetadata(videoId: string): Promise<VideoMetadata
         thumbnails?: Record<string, { url: string }>;
       };
       contentDetails: { duration: string };
-      status: { embeddable: boolean; privacyStatus: string };
+      status: { embeddable: boolean; privacyStatus: string; madeForKids?: boolean };
     }[];
   };
 
@@ -419,7 +443,29 @@ export async function fetchVideoMetadata(videoId: string): Promise<VideoMetadata
     durationSec: parseIsoDuration(item.contentDetails.duration),
     embeddable: item.status.embeddable,
     privacyStatus: item.status.privacyStatus,
+    // The video flag OR the channel flag. YouTube applies the kids restrictions
+    // when EITHER is set, and a channel-level setting is not guaranteed to appear
+    // on every individual upload — so trusting the per-video field alone leaves a
+    // hole where a kids channel produces a video that reads as ordinary.
+    madeForKids: item.status.madeForKids === true || (await channelIsMadeForKids(item.snippet.channelId)),
   };
+}
+
+/**
+ * Channel-level "Made for Kids", as a fallback signal.
+ *
+ * Consulted only when the video itself does not carry the flag, so it costs one
+ * extra unit on ordinary videos and none on kids content. Failures answer "not
+ * stated" rather than propagating: this is a widening safety signal, and an
+ * unreachable channels endpoint must not block registering a perfectly good video.
+ */
+async function channelIsMadeForKids(channelId: string): Promise<boolean> {
+  try {
+    const channel = await fetchChannelById(channelId);
+    return channel?.madeForKids === true;
+  } catch {
+    return false;
+  }
 }
 
 export type ChannelMetadata = {
@@ -428,6 +474,15 @@ export type ChannelMetadata = {
   thumbnailUrl: string | null;
   subscriberCount: number | null;
   customUrl: string | null;
+  /**
+   * Channel-level "Made for Kids" setting, when YouTube reports one.
+   *
+   * A second, independent signal for the same restriction. Measured on this
+   * deployment: a kids channel returns `true` here and every one of its uploads
+   * carries the per-video flag as well, while an ordinary channel may omit the
+   * field entirely — so `null` means "not stated", never "no".
+   */
+  madeForKids: boolean | null;
 };
 
 /** The channel owned by the OAuth-authenticated user — this is what proves ownership. */
@@ -440,12 +495,13 @@ export async function fetchOwnChannel(userId: string): Promise<ChannelMetadata |
       id: string;
       snippet: { title: string; customUrl?: string; thumbnails?: Record<string, { url: string }> };
       statistics?: { subscriberCount?: string; hiddenSubscriberCount?: boolean };
+      status?: { madeForKids?: boolean };
     }[];
   };
 
   const data = await apiGet<Response>(
     "channels",
-    { part: "snippet,statistics", mine: "true" },
+    { part: "snippet,statistics,status", mine: "true" },
     { accessToken: token.accessToken }
   );
   const item = data.items?.[0];
@@ -458,6 +514,7 @@ export async function fetchOwnChannel(userId: string): Promise<ChannelMetadata |
     thumbnailUrl: thumbs.high?.url ?? thumbs.medium?.url ?? thumbs.default?.url ?? null,
     subscriberCount: item.statistics?.subscriberCount ? Number(item.statistics.subscriberCount) : null,
     customUrl: item.snippet.customUrl ?? null,
+    madeForKids: item.status?.madeForKids ?? null,
   };
 }
 
@@ -468,9 +525,10 @@ export async function fetchChannelById(channelId: string): Promise<ChannelMetada
       id: string;
       snippet: { title: string; customUrl?: string; thumbnails?: Record<string, { url: string }> };
       statistics?: { subscriberCount?: string };
+      status?: { madeForKids?: boolean };
     }[];
   };
-  const data = await apiGet<Response>("channels", { part: "snippet,statistics", id: channelId }, {});
+  const data = await apiGet<Response>("channels", { part: "snippet,statistics,status", id: channelId }, {});
   const item = data.items?.[0];
   if (!item) return null;
   const thumbs = item.snippet.thumbnails ?? {};
@@ -480,6 +538,7 @@ export async function fetchChannelById(channelId: string): Promise<ChannelMetada
     thumbnailUrl: thumbs.high?.url ?? thumbs.default?.url ?? null,
     subscriberCount: item.statistics?.subscriberCount ? Number(item.statistics.subscriberCount) : null,
     customUrl: item.snippet.customUrl ?? null,
+    madeForKids: item.status?.madeForKids ?? null,
   };
 }
 
