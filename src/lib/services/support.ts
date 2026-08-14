@@ -395,7 +395,7 @@ async function loadLiveSession(tx: Tx, sessionId: string, supporterId: string) {
 export async function openWatchTarget(input: { sessionId: string; supporterId: string }): Promise<WatchTimerResult> {
   return prisma.$transaction(async (tx) => {
     await tx.$queryRaw`
-      SELECT "id" FROM "WatchSession" WHERE "sessionId" = ${input.sessionId} FOR UPDATE
+      SELECT "id" FROM public."WatchSession" WHERE "sessionId" = ${input.sessionId} FOR UPDATE
     `;
     const session = await loadLiveSession(tx, input.sessionId, input.supporterId);
     const watch = session.watchSession!;
@@ -932,7 +932,7 @@ async function runCompletion(input: { sessionId: string; supporterId: string }) 
       // Budget, lifetime capacity and the UTC-day limit are claimed by one row
       // update. Any later failure rolls all counters back with this transaction.
       const reserved = await tx.$queryRaw<Array<{ id: string }>>`
-        UPDATE "Campaign"
+        UPDATE public."Campaign"
         SET "spentCredits" = "spentCredits" + ${settlement.budgetCost},
             "completedSupports" = "completedSupports" + 1,
             "dailySupports" = CASE
@@ -1479,7 +1479,7 @@ export async function resolveHeldReward(input: {
       // that was never credited. Clamped so no adjustment can drive it negative.
       if (support.creditsAwarded > 0) {
         await tx.$executeRaw`
-          UPDATE "Campaign"
+          UPDATE public."Campaign"
           SET "spentCredits" = GREATEST(0, "spentCredits" - ${support.creditsAwarded})
           WHERE "id" = ${support.campaignId};
         `;
@@ -1664,7 +1664,7 @@ export async function reverseSupport(input: {
     // elsewhere must never be able to drive `spentCredits` negative.
     if (support.creditsAwarded > 0) {
       await tx.$executeRaw`
-        UPDATE "Campaign"
+        UPDATE public."Campaign"
         SET "spentCredits" = GREATEST(0, "spentCredits" - ${support.creditsAwarded})
         WHERE "id" = ${support.campaignId};
       `;

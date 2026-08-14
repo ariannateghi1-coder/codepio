@@ -218,7 +218,7 @@ export const PATCH = active(
     const updated = await prisma.$transaction(async (tx) => {
       const lockedRows = await tx.$queryRaw<Array<{ budgetCredits: number; spentCredits: number; status: string }>>`
         SELECT "budgetCredits", "spentCredits", "status"
-        FROM "Campaign"
+        FROM public."Campaign"
         WHERE "id" = ${campaign.id} AND "creatorId" = ${user.id}
         FOR UPDATE
       `;

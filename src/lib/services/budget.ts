@@ -123,7 +123,7 @@ export async function endCampaignWithRefund(input: { campaignId: string; creator
       spentCredits: number;
     }>>`
       SELECT "id", "creatorId", "status", "budgetCredits", "spentCredits"
-      FROM "Campaign"
+      FROM public."Campaign"
       WHERE "id" = ${input.campaignId} AND "creatorId" = ${input.creatorId}
       FOR UPDATE
     `;

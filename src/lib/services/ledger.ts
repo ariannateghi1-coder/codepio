@@ -47,7 +47,7 @@ function clampReputation(value: number) {
  */
 async function lockUser(tx: Tx, userId: string): Promise<void> {
   const rows = await tx.$queryRaw<Array<{ id: string }>>`
-    SELECT "id" FROM "User" WHERE "id" = ${userId} FOR UPDATE
+    SELECT "id" FROM public."User" WHERE "id" = ${userId} FOR UPDATE
   `;
   if (rows.length === 0) {
     await tx.user.findUniqueOrThrow({ where: { id: userId }, select: { id: true } });

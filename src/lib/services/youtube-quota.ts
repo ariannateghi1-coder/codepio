@@ -79,7 +79,7 @@ export async function recordQuotaSpend(units = QUOTA_COST.subscriptionsList): Pr
 
   try {
     const rows = await prisma.$queryRaw<{ count: number }[]>`
-      INSERT INTO "RateLimit" ("key", "count", "expiresAt", "updatedAt")
+      INSERT INTO public."RateLimit" ("key", "count", "expiresAt", "updatedAt")
       VALUES (${counterKey(now)}, ${units}, ${expiresAt}, ${now})
       ON CONFLICT ("key") DO UPDATE SET
         "count" = "RateLimit"."count" + ${units},

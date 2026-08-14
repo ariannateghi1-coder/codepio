@@ -133,7 +133,7 @@ async function seed(client: PrismaClient): Promise<Fixture> {
   });
   // updatedAt is @updatedAt, so it must be aged with raw SQL — Prisma overwrites
   // any value passed through the client.
-  await client.$executeRaw`UPDATE "SupportSession" SET "updatedAt" = ${ago(10)} WHERE "id" = ${settled.id}`;
+  await client.$executeRaw`UPDATE public."SupportSession" SET "updatedAt" = ${ago(10)} WHERE "id" = ${settled.id}`;
 
   await client.watchSession.create({
     data: { sessionId: settled.id, videoId: video.id, durationSec: 120, requiredSec: 108, accumulatedSec: 110 },
@@ -157,7 +157,7 @@ async function seed(client: PrismaClient): Promise<Fixture> {
       expiresAt: new Date(Date.now() + DAY),
     },
   });
-  await client.$executeRaw`UPDATE "SupportSession" SET "updatedAt" = ${ago(90)} WHERE "id" = ${open.id}`;
+  await client.$executeRaw`UPDATE public."SupportSession" SET "updatedAt" = ${ago(90)} WHERE "id" = ${open.id}`;
   await client.watchSession.create({
     data: { sessionId: open.id, videoId: video.id, durationSec: 120, requiredSec: 108, accumulatedSec: 40 },
   });
@@ -181,7 +181,7 @@ async function seed(client: PrismaClient): Promise<Fixture> {
       completedAt: ago(90),
     },
   });
-  await client.$executeRaw`UPDATE "SupportSession" SET "updatedAt" = ${ago(90)} WHERE "id" = ${held.id}`;
+  await client.$executeRaw`UPDATE public."SupportSession" SET "updatedAt" = ${ago(90)} WHERE "id" = ${held.id}`;
   await client.watchSession.create({
     data: { sessionId: held.id, videoId: video.id, durationSec: 120, requiredSec: 108, accumulatedSec: 109 },
   });

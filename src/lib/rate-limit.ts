@@ -92,7 +92,7 @@ async function postgresRateLimit(key: string, limit: number, windowSeconds: numb
   const nextExpiry = new Date(now.getTime() + windowSeconds * 1000);
 
   const rows = await prisma.$queryRaw<{ count: number; expiresAt: Date }[]>`
-    INSERT INTO "RateLimit" ("key", "count", "expiresAt", "updatedAt")
+    INSERT INTO public."RateLimit" ("key", "count", "expiresAt", "updatedAt")
     VALUES (${key}, 1, ${nextExpiry}, ${now})
     ON CONFLICT ("key") DO UPDATE SET
       "count" = CASE WHEN "RateLimit"."expiresAt" < ${now} THEN 1 ELSE "RateLimit"."count" + 1 END,
