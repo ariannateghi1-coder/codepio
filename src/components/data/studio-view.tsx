@@ -436,7 +436,8 @@ function CreateCampaignModal({
         budgetCredits: Number(form.get("budgetCredits")),
         maxSupportsPerUser: 1,
         dailyLimit: Number(form.get("dailyLimit") ?? 100),
-        minAccountAgeHours: Number(form.get("minAccountAgeHours") ?? 0),
+        // No minAccountAgeHours: the account-age requirement is gone, so there is
+        // no field to send and nothing to configure for it below.
         kidsContent,
         tasks,
       });
@@ -507,14 +508,18 @@ function CreateCampaignModal({
             <Input id="days" name="days" type="number" min={1} max={365} defaultValue={30} dir="ltr" className="latin" />
           </Field>
 
-          <Field
-            label="حداقل سن حساب (ساعت)"
-            htmlFor="minAccountAgeHours"
-            hint="برای کاهش سوءاستفاده حساب‌های تازه"
-            error={fields.minAccountAgeHours}
-          >
-            <Input id="minAccountAgeHours" name="minAccountAgeHours" type="number" min={0} max={720} defaultValue={0} dir="ltr" className="latin" />
-          </Field>
+          {/*
+            A "minimum account age" input used to sit here, and is deliberately gone.
+            It read like a mild anti-abuse knob but acted as a hard refusal: a creator
+            who typed 30 locked out most of the platform — themselves included — with
+            nothing on screen saying that was the consequence. Account age still feeds
+            the risk score, where it is weighed against real behaviour instead of
+            deciding on its own.
+          */}
+          <div className="rounded-lg bg-surface-sunken p-3 text-xs leading-6 text-fg-muted">
+            همه حساب‌ها می‌توانند از این کمپین حمایت کنند و حساب‌های تازه محدودیتی ندارند. رفتار مشکوک همچنان توسط سامانه
+            ضدسوءاستفاده بررسی می‌شود.
+          </div>
         </div>
 
         <div className="space-y-3 rounded-lg border border-border p-3">

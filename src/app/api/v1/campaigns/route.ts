@@ -119,7 +119,9 @@ export const POST = active(
           maxTotalSupports: data.maxTotalSupports ?? null,
           maxSupportsPerUser: data.maxSupportsPerUser ?? null,
           dailyLimit: data.dailyLimit ?? null,
-          minAccountAgeHours: data.minAccountAgeHours,
+          // minAccountAgeHours is intentionally not set: a newly registered account
+          // may support immediately. Account age stays a risk SIGNAL in anti-abuse,
+          // never an admission gate. The column keeps its 0 default.
           // Declared by the creator, and forced on when YouTube itself reports the
           // video as kids content: there the like is provably unverifiable, so
           // running without the waiver would keep failing honest supporters no

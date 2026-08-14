@@ -195,7 +195,16 @@ export const campaignCreateSchema = z
     maxTotalSupports: z.coerce.number().int().min(1).max(100_000).optional().nullable(),
     maxSupportsPerUser: z.coerce.number().int().min(1).max(100).optional().nullable(),
     dailyLimit: z.coerce.number().int().min(1).max(10_000).optional().nullable(),
-    minAccountAgeHours: z.coerce.number().int().min(0).max(720).default(0),
+    /**
+     * REMOVED: minAccountAgeHours.
+     *
+     * The field is gone from the API surface rather than merely defaulted to 0, so
+     * an old client cannot reintroduce the gate. Because the object is not strict,
+     * a stale client still sending it is simply ignored instead of erroring — the
+     * campaign is created without an age requirement, which is the intended
+     * behaviour now. The column stays in the schema for historical campaigns; no
+     * code reads it to decide anything.
+     */
     /**
      * Creator declaration: this is kids content, so subscribe and like cannot be
      * verified through the YouTube API and are waived instead of failed.

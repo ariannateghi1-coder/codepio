@@ -553,7 +553,13 @@ model Campaign {
   maxTotalSupports     Int?
   maxSupportsPerUser   Int?
   dailyLimit           Int?
-  /// Minimum account age (hours) a supporter needs — cheap anti-throwaway gate.
+  /// LEGACY, always 0. Was a minimum supporter account age in hours, enforced as a
+  /// hard refusal at session start. It blocked ordinary new members (a value of 30
+  /// locked out most of the platform, the creator who set it included) while doing
+  /// nothing to a farmer, who only had to wait. Account age is now a risk SIGNAL in
+  /// anti-abuse.ts instead of an admission gate. Kept as a column so historical rows
+  /// stay readable; no code reads it to decide anything, and the API no longer
+  /// accepts it.
   minAccountAgeHours   Int  @default(0)
   /// Creator-set exposure priority, clamped server-side.
   priority             Int  @default(0)

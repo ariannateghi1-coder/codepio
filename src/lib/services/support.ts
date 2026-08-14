@@ -84,7 +84,6 @@ const RULE_MESSAGES: Record<string, string> = {
   DAILY_LIMIT: "سقف روزانه این کمپین پر شده است.",
   USER_LIMIT: "سهم شما از این کمپین تکمیل شده است.",
   DUPLICATE_SUPPORT: "قبلاً در این کمپین حمایت کرده‌اید.",
-  ACCOUNT_TOO_NEW: "برای این کمپین حساب شما باید قدیمی‌تر باشد.",
   CREATOR_UNAVAILABLE: "حساب سازنده این کمپین در دسترس نیست.",
   VIDEO_UNAVAILABLE: "ویدیوی این کمپین در دسترس نیست.",
   SESSION_NOT_FOUND: "این نشست حمایت پیدا نشد.",
@@ -173,10 +172,22 @@ async function assertEligible(tx: Tx, input: EligibilityInput) {
   });
   if (supporter.status !== "ACTIVE") throw ruleError("CREATOR_UNAVAILABLE");
 
-  if (campaign.minAccountAgeHours > 0) {
-    const ageHours = (now.getTime() - supporter.createdAt.getTime()) / 3_600_000;
-    if (ageHours < campaign.minAccountAgeHours) throw ruleError("ACCOUNT_TOO_NEW");
-  }
+  // NOTE: there is deliberately NO minimum-account-age gate here any more.
+  //
+  // It was a per-campaign hour threshold that refused a support outright, and it
+  // failed in the one way an anti-abuse rule must not: it punished the honest
+  // majority to deter a minority it never actually stopped. A campaign set to 30
+  // hours locked out four of six accounts on the platform — including the creator
+  // who set it, who had no way to see that was the consequence — while anyone
+  // farming supports simply waits, because age is the one requirement that
+  // satisfies itself by doing nothing.
+  //
+  // Age has not stopped being a signal; it stopped being a verdict. It still
+  // feeds the risk score in anti-abuse.ts (ACCOUNT_TOO_NEW, severity 3), where it
+  // combines with evidence that is actually about behaviour — velocity, pair
+  // farming, shared fingerprints, rings. On its own it scores 24 against a review
+  // threshold of 50, so a genuine first support from a new account pays out, and
+  // a new account behaving like a farm still lands in the queue.
 
   // Already completed for this pair+campaign? The unique index is the real
   // guard, this is the friendly early exit.
