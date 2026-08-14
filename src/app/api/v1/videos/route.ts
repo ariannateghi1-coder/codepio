@@ -38,6 +38,10 @@ export const GET = authed(
         status: true,
         createdAt: true,
         metadataSyncedAt: true,
+        // Surfaced so the studio can pre-tick the kids-content switch and explain
+        // why, instead of letting the creator discover the consequence from a
+        // supporter's failed task.
+        madeForKids: true,
         _count: { select: { supports: true, campaigns: true } },
       },
     }),
@@ -101,6 +105,16 @@ export const POST = active(
           description: metadata?.description ?? data.description ?? null,
           thumbnailUrl: metadata?.thumbnailUrl ?? youtubeThumbnailUrl(videoId),
           durationSec: metadata?.durationSec ?? null,
+          // The owning channel is captured here because it is the subscribe target
+          // every supporter will be checked against. Recording it at registration
+          // means the target exists for every campaign video, including those whose
+          // uploader never connected their YouTube account.
+          channelId: metadata?.channelId ?? null,
+          channelTitle: metadata?.channelTitle ?? null,
+          // Captured so the flow can warn that the LIKE task cannot be verified on
+          // kids content: YouTube does not reliably surface such likes in the
+          // viewer's own "Liked videos" list, which is all a read-only grant can see.
+          madeForKids: metadata?.madeForKids ?? null,
           metadataSyncedAt: metadata ? new Date() : null,
         },
       });

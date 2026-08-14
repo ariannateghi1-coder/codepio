@@ -77,6 +77,25 @@ const schema = z.object({
   VAPID_SUBJECT: z.string().default("mailto:admin@academy-support.example"),
 
   /**
+   * ---- Outbound email (SMTP) ----
+   *
+   * Optional as a group, but the group is all-or-nothing: a host without
+   * credentials, or credentials without a From address, is a configuration
+   * mistake rather than a partially working mailer. Enforced by the superRefine
+   * below, so no call site has to re-check the combination.
+   *
+   * SMTP_FROM must be an address the provider has authorised for the account
+   * (in Brevo: a validated sender). Providers reject an unverified From outright,
+   * which would make every reset email fail while the app still looks healthy.
+   */
+  SMTP_HOST: z.string().min(1).optional(),
+  SMTP_PORT: z.coerce.number().int().min(1).max(65535).default(587),
+  SMTP_USER: z.string().min(1).optional(),
+  SMTP_PASSWORD: z.string().min(1).optional(),
+  SMTP_FROM: z.string().email("SMTP_FROM must be a valid email address").optional(),
+  SMTP_FROM_NAME: z.string().default("آکادمی حمایت"),
+
+  /**
    * Bearer secret for the scheduled maintenance endpoint. When unset, a value is
    * derived from SESSION_SECRET so the endpoint is never open — but SESSION_SECRET
    * itself is never accepted directly, because a cron configuration is far more
@@ -89,10 +108,43 @@ const schema = z.object({
   GOOGLE_CLIENT_SECRET: z.string().optional(),
   YOUTUBE_API_KEY: z.string().optional(),
 
+  /**
+   * Daily YouTube Data API quota, in units. Google's default for a new project is
+   * 10,000/day, reset at midnight Pacific.
+   *
+   * Configurable rather than hard-coded because a project with an approved quota
+   * increase has a genuinely different budget, and the subscription-compliance
+   * sweep sizes its own spend as a fraction of this number. Setting it too high
+   * does not create quota — it only makes the sweep keep working until Google
+   * starts answering 403, which callers already treat as a temporary error rather
+   * than a failed verification.
+   */
+  YOUTUBE_DAILY_QUOTA: z.coerce.number().int().min(1_000).default(10_000),
+
   LOG_LEVEL: z.enum(["debug", "info", "warn", "error"]).default(isProd ? "info" : "debug"),
 });
 
-const parsed = schema.safeParse(process.env);
+/**
+ * Cross-field rule: SMTP is either fully configured or absent.
+ *
+ * A half-configured mailer is the worst of the three states — `features.email`
+ * would be false and password reset would silently do nothing, which is exactly
+ * the "password reset works" lie productionReadiness() exists to prevent.
+ */
+const envSchema = schema.superRefine((value, ctx) => {
+  const group = [value.SMTP_HOST, value.SMTP_USER, value.SMTP_PASSWORD, value.SMTP_FROM];
+  const provided = group.filter(Boolean).length;
+  if (provided !== 0 && provided !== group.length) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["SMTP_HOST"],
+      message:
+        "SMTP is partially configured: SMTP_HOST, SMTP_USER, SMTP_PASSWORD and SMTP_FROM must all be set, or all be empty.",
+    });
+  }
+});
+
+const parsed = envSchema.safeParse(process.env);
 
 if (!parsed.success) {
   const detail = parsed.error.issues
@@ -112,6 +164,7 @@ export const features = {
   webPush: Boolean(env.VAPID_PUBLIC_KEY && env.VAPID_PRIVATE_KEY),
   youtubeOAuth: Boolean(env.GOOGLE_CLIENT_ID && env.GOOGLE_CLIENT_SECRET),
   youtubeDataApi: Boolean(env.YOUTUBE_API_KEY),
+  email: Boolean(env.SMTP_HOST && env.SMTP_USER && env.SMTP_PASSWORD && env.SMTP_FROM),
 } as const;
 
 /**
@@ -121,6 +174,7 @@ export const features = {
  */
 export function productionReadiness() {
   const missing: string[] = [];
+  if (!features.email) missing.push("SMTP_HOST/USER/PASSWORD/FROM (password reset emails cannot be sent)");
   if (!features.youtubeDataApi) missing.push("YOUTUBE_API_KEY (video metadata cannot be validated)");
   if (!features.youtubeOAuth) missing.push("GOOGLE_CLIENT_ID/SECRET (subscribe & like cannot be API-verified)");
   if (!features.redisRateLimit) missing.push("UPSTASH_REDIS_REST_URL/TOKEN (rate limiting falls back to Postgres)");

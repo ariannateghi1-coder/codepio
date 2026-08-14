@@ -5,6 +5,7 @@ import { env, features } from "../env";
 import { logger } from "../logger";
 import { UpstreamError, internalMessage } from "../errors";
 import { encryptSecret, decryptSecret } from "../crypto";
+import { QUOTA_COST, recordQuotaSpend } from "./youtube-quota";
 import { parseIsoDuration, isValidYoutubeChannelId, isValidYoutubeVideoId } from "../youtube";
 
 /**
@@ -241,16 +242,19 @@ async function bumpFailure(userId: string, code: string): Promise<number> {
 export async function youtubeConnectionState(userId: string): Promise<{
   state: YoutubeConnectionState;
   channelId: string | null;
+  /** The Google account the checks will run against, when known. */
+  googleEmail: string | null;
   lastErrorCode: string | null;
 }> {
   const account = await prisma.youtubeAccount.findUnique({
     where: { userId },
-    select: { state: true, channelId: true, revokedAt: true, lastErrorCode: true },
+    select: { state: true, channelId: true, googleEmail: true, revokedAt: true, lastErrorCode: true },
   });
-  if (!account) return { state: "DISCONNECTED", channelId: null, lastErrorCode: null };
+  if (!account) return { state: "DISCONNECTED", channelId: null, googleEmail: null, lastErrorCode: null };
   return {
     state: account.revokedAt && account.state === "CONNECTED" ? "DISCONNECTED" : account.state,
     channelId: account.channelId,
+    googleEmail: account.googleEmail,
     lastErrorCode: account.lastErrorCode,
   };
 }
@@ -258,11 +262,22 @@ export async function youtubeConnectionState(userId: string): Promise<{
 export async function storeOAuthGrant(input: {
   userId: string;
   googleSub: string;
+  /**
+   * The Google account this grant belongs to.
+   *
+   * Stored so the product can NAME the identity it inspects. A user with several
+   * Google accounts — the browser on one, the YouTube app on another — performs a
+   * real subscribe or like that this grant cannot see, and a bare "not verified"
+   * gives them no way to discover that. The channel title alone is not enough:
+   * people recognise their email, not their channel id.
+   */
+  googleEmail?: string | null;
   tokens: TokenResponse;
   channelId?: string | null;
 }) {
   const data = {
     googleSub: input.googleSub,
+    ...(input.googleEmail ? { googleEmail: input.googleEmail } : {}),
     scope: input.tokens.scope,
     accessTokenCipher: encryptSecret(input.tokens.access_token),
     accessTokenExpires: new Date(Date.now() + input.tokens.expires_in * 1000),
@@ -372,6 +387,16 @@ export type VideoMetadata = {
   durationSec: number | null;
   embeddable: boolean;
   privacyStatus: string;
+  /**
+   * True when YouTube applies its kids restrictions to this video — set by the
+   * video's own flag OR by its channel's.
+   *
+   * Decides whether subscribe and like are verifiable at all. On kids content the
+   * like does not appear in the viewer's own "Liked videos" playlist, which is the
+   * only like surface a read-only grant can read, and subscriptions behave the same
+   * way as far as we can tell from outside.
+   */
+  madeForKids: boolean;
 };
 
 /** Authoritative metadata straight from YouTube — never trusted from the client. */
@@ -390,7 +415,7 @@ export async function fetchVideoMetadata(videoId: string): Promise<VideoMetadata
         thumbnails?: Record<string, { url: string }>;
       };
       contentDetails: { duration: string };
-      status: { embeddable: boolean; privacyStatus: string };
+      status: { embeddable: boolean; privacyStatus: string; madeForKids?: boolean };
     }[];
   };
 
@@ -418,7 +443,29 @@ export async function fetchVideoMetadata(videoId: string): Promise<VideoMetadata
     durationSec: parseIsoDuration(item.contentDetails.duration),
     embeddable: item.status.embeddable,
     privacyStatus: item.status.privacyStatus,
+    // The video flag OR the channel flag. YouTube applies the kids restrictions
+    // when EITHER is set, and a channel-level setting is not guaranteed to appear
+    // on every individual upload — so trusting the per-video field alone leaves a
+    // hole where a kids channel produces a video that reads as ordinary.
+    madeForKids: item.status.madeForKids === true || (await channelIsMadeForKids(item.snippet.channelId)),
   };
+}
+
+/**
+ * Channel-level "Made for Kids", as a fallback signal.
+ *
+ * Consulted only when the video itself does not carry the flag, so it costs one
+ * extra unit on ordinary videos and none on kids content. Failures answer "not
+ * stated" rather than propagating: this is a widening safety signal, and an
+ * unreachable channels endpoint must not block registering a perfectly good video.
+ */
+async function channelIsMadeForKids(channelId: string): Promise<boolean> {
+  try {
+    const channel = await fetchChannelById(channelId);
+    return channel?.madeForKids === true;
+  } catch {
+    return false;
+  }
 }
 
 export type ChannelMetadata = {
@@ -427,6 +474,15 @@ export type ChannelMetadata = {
   thumbnailUrl: string | null;
   subscriberCount: number | null;
   customUrl: string | null;
+  /**
+   * Channel-level "Made for Kids" setting, when YouTube reports one.
+   *
+   * A second, independent signal for the same restriction. Measured on this
+   * deployment: a kids channel returns `true` here and every one of its uploads
+   * carries the per-video flag as well, while an ordinary channel may omit the
+   * field entirely — so `null` means "not stated", never "no".
+   */
+  madeForKids: boolean | null;
 };
 
 /** The channel owned by the OAuth-authenticated user — this is what proves ownership. */
@@ -439,12 +495,13 @@ export async function fetchOwnChannel(userId: string): Promise<ChannelMetadata |
       id: string;
       snippet: { title: string; customUrl?: string; thumbnails?: Record<string, { url: string }> };
       statistics?: { subscriberCount?: string; hiddenSubscriberCount?: boolean };
+      status?: { madeForKids?: boolean };
     }[];
   };
 
   const data = await apiGet<Response>(
     "channels",
-    { part: "snippet,statistics", mine: "true" },
+    { part: "snippet,statistics,status", mine: "true" },
     { accessToken: token.accessToken }
   );
   const item = data.items?.[0];
@@ -457,6 +514,7 @@ export async function fetchOwnChannel(userId: string): Promise<ChannelMetadata |
     thumbnailUrl: thumbs.high?.url ?? thumbs.medium?.url ?? thumbs.default?.url ?? null,
     subscriberCount: item.statistics?.subscriberCount ? Number(item.statistics.subscriberCount) : null,
     customUrl: item.snippet.customUrl ?? null,
+    madeForKids: item.status?.madeForKids ?? null,
   };
 }
 
@@ -467,9 +525,10 @@ export async function fetchChannelById(channelId: string): Promise<ChannelMetada
       id: string;
       snippet: { title: string; customUrl?: string; thumbnails?: Record<string, { url: string }> };
       statistics?: { subscriberCount?: string };
+      status?: { madeForKids?: boolean };
     }[];
   };
-  const data = await apiGet<Response>("channels", { part: "snippet,statistics", id: channelId }, {});
+  const data = await apiGet<Response>("channels", { part: "snippet,statistics,status", id: channelId }, {});
   const item = data.items?.[0];
   if (!item) return null;
   const thumbs = item.snippet.thumbnails ?? {};
@@ -479,6 +538,7 @@ export async function fetchChannelById(channelId: string): Promise<ChannelMetada
     thumbnailUrl: thumbs.high?.url ?? thumbs.default?.url ?? null,
     subscriberCount: item.statistics?.subscriberCount ? Number(item.statistics.subscriberCount) : null,
     customUrl: item.snippet.customUrl ?? null,
+    madeForKids: item.status?.madeForKids ?? null,
   };
 }
 
@@ -539,6 +599,7 @@ export async function checkSubscription(userId: string, channelId: string): Prom
 
   try {
     type Response = { items?: { id: string }[]; pageInfo?: { totalResults: number } };
+    await recordQuotaSpend(QUOTA_COST.subscriptionsList);
     const data = await apiGet<Response>(
       "subscriptions",
       { part: "snippet", forChannelId: channelId, mine: "true", maxResults: "1" },
@@ -553,6 +614,85 @@ export async function checkSubscription(userId: string, channelId: string): Prom
     };
   } catch (e) {
     return await apiFailureToCheck(userId, e, { channelId });
+  }
+}
+
+/**
+ * Is `userId` subscribed to EACH of `channelIds`?
+ *
+ * THE ONE REAL BATCHING WIN AVAILABLE HERE
+ * `subscriptions.list` accepts a comma-separated `forChannelId`, and the call
+ * costs 1 quota unit no matter how many channels are listed. So a supporter with
+ * six outstanding obligations is answered for 1 unit instead of 6.
+ *
+ * WHAT CANNOT BE BATCHED, STATED PLAINLY
+ * Users. Every call is signed with that user's own OAuth token, so no request
+ * shape answers for two people. The cost of compliance is therefore one unit per
+ * user per TTL window — batching helps within a user and not across them, and any
+ * capacity planning that assumes otherwise is wrong.
+ *
+ * FAILURE SEMANTICS
+ * All-or-nothing. On failure the verdict applies to every channel asked about,
+ * because a partial answer is indistinguishable from "subscribed to some": the
+ * API returns only matches, so a missing tail looks identical whether the user is
+ * not subscribed or the request died early. Marking a subset NOT_VERIFIED off a
+ * failed call is precisely how an outage becomes a wave of false violations.
+ *
+ * `maxResults` follows the number of channels asked about rather than being
+ * pinned at 1, since a truncated page would silently read as "not subscribed"
+ * for everything past the cut.
+ */
+export async function checkSubscriptions(
+  userId: string,
+  channelIds: string[]
+): Promise<{ outcome: CheckOutcome; available: boolean; subscribed: Set<string>; detail?: Record<string, unknown> }> {
+  const unique = [...new Set(channelIds.filter(Boolean))];
+  if (unique.length === 0) {
+    return { outcome: "VERIFIED", available: true, subscribed: new Set() };
+  }
+
+  const token = await getAccessToken(userId);
+  if (!token.ok) {
+    const failure = checkFromTokenFailure(token);
+    return { outcome: failure.outcome, available: false, subscribed: new Set(), detail: failure.detail };
+  }
+
+  try {
+    type Response = {
+      items?: { snippet?: { resourceId?: { channelId?: string } } }[];
+      pageInfo?: { totalResults: number };
+    };
+    await recordQuotaSpend(QUOTA_COST.subscriptionsList);
+    const data = await apiGet<Response>(
+      "subscriptions",
+      {
+        part: "snippet",
+        forChannelId: unique.join(","),
+        mine: "true",
+        maxResults: String(Math.min(50, Math.max(1, unique.length))),
+      },
+      { accessToken: token.accessToken }
+    );
+
+    // Built from the resource ids the API returned, intersected with what was
+    // asked. An unexpected extra item therefore cannot mark an unrelated
+    // obligation satisfied.
+    const asked = new Set(unique);
+    const subscribed = new Set<string>();
+    for (const item of data.items ?? []) {
+      const id = item.snippet?.resourceId?.channelId;
+      if (id && asked.has(id)) subscribed.add(id);
+    }
+
+    return {
+      outcome: "VERIFIED",
+      available: true,
+      subscribed,
+      detail: { asked: unique.length, matched: subscribed.size, totalResults: data.pageInfo?.totalResults ?? 0 },
+    };
+  } catch (e) {
+    const failure = await apiFailureToCheck(userId, e, { channels: unique.length });
+    return { outcome: failure.outcome, available: false, subscribed: new Set(), detail: failure.detail };
   }
 }
 

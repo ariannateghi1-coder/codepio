@@ -1,5 +1,6 @@
 import "server-only";
 import crypto from "crypto";
+import { cache } from "react";
 import argon2 from "argon2";
 import { cookies } from "next/headers";
 import type { Role, User, UserStatus } from "@prisma/client";
@@ -93,7 +94,7 @@ export async function createSession(userId: string, req?: Request) {
 }
 
 /** Loads the session + user, enforcing expiry, revocation and idle timeout. */
-export async function getSessionContext(): Promise<SessionContext | null> {
+async function loadSessionContext(): Promise<SessionContext | null> {
   const token = (await cookies()).get(SESSION_COOKIE)?.value;
   if (!token) return null;
 
@@ -118,6 +119,21 @@ export async function getSessionContext(): Promise<SessionContext | null> {
 
   return { user: session.user, sessionId: session.id };
 }
+
+/**
+ * Per-request memoized session lookup.
+ *
+ * A single authenticated request resolves the session more than once — the auth
+ * guard needs the user, the handler needs the sessionId, and nested server
+ * components may ask again — and each call was previously a separate round trip
+ * to Postgres for the same row. React's cache() dedupes them within one request
+ * without leaking across requests, which a module-level cache would do.
+ *
+ * The wrapped function performs writes (idle revocation, throttled lastSeenAt),
+ * so deduping is also the correct behaviour rather than merely faster: those
+ * writes should happen once per request, not once per caller.
+ */
+export const getSessionContext = cache(loadSessionContext);
 
 export async function getSessionUser(): Promise<User | null> {
   return (await getSessionContext())?.user ?? null;

@@ -24,6 +24,11 @@ export const POST = active<unknown, { id: string }>("videos.sync", async ({ req,
       description: metadata.description,
       thumbnailUrl: metadata.thumbnailUrl,
       durationSec: metadata.durationSec,
+      // Re-synced too, so a video that was registered before this column existed
+      // gains its subscribe target the first time its metadata is refreshed.
+      channelId: metadata.channelId,
+      channelTitle: metadata.channelTitle,
+      madeForKids: metadata.madeForKids,
       metadataSyncedAt: new Date(),
       // A video that stopped being public/embeddable can no longer support watch
       // verification, so it leaves Explore automatically.

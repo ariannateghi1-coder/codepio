@@ -39,6 +39,14 @@ export const RATE_LIMITS = {
   pushSubscribe: { limit: 20, windowSeconds: 3600 },
   notificationWrite: { limit: 120, windowSeconds: 3600 },
   realtimeToken: { limit: 60, windowSeconds: 3600 },
+  /**
+   * User-triggered subscription re-check. Low on purpose: this is the only
+   * user-facing path that spends YouTube quota, so an unlimited version would let
+   * one account drain the platform's daily allowance by holding a button down.
+   * Six per hour covers a genuine "I re-subscribed, check again" several times
+   * over without being enough to matter against a 10,000-unit budget.
+   */
+  complianceRecheck: { limit: 6, windowSeconds: 3600 },
   publicSearch: { limit: 120, windowSeconds: 300 },
   explore: { limit: 300, windowSeconds: 300 },
   adminMutation: { limit: 200, windowSeconds: 3600 },
@@ -84,7 +92,7 @@ async function postgresRateLimit(key: string, limit: number, windowSeconds: numb
   const nextExpiry = new Date(now.getTime() + windowSeconds * 1000);
 
   const rows = await prisma.$queryRaw<{ count: number; expiresAt: Date }[]>`
-    INSERT INTO "RateLimit" ("key", "count", "expiresAt", "updatedAt")
+    INSERT INTO public."RateLimit" ("key", "count", "expiresAt", "updatedAt")
     VALUES (${key}, 1, ${nextExpiry}, ${now})
     ON CONFLICT ("key") DO UPDATE SET
       "count" = CASE WHEN "RateLimit"."expiresAt" < ${now} THEN 1 ELSE "RateLimit"."count" + 1 END,

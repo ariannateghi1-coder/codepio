@@ -2,7 +2,7 @@ import "server-only";
 import { Prisma, type SupportSession, type VerificationMethod } from "@prisma/client";
 import { prisma } from "../prisma";
 import { logger } from "../logger";
-import { BusinessRuleError, ConflictError, NotFoundError } from "../errors";
+import { BusinessRuleError, ConflictError, NotFoundError, internalMessage } from "../errors";
 import { REWARDS, TASK_REWARDS, WATCH_RULES } from "../gamification";
 import {
   compensateMissingXp,
@@ -23,7 +23,8 @@ import {
 } from "./watch";
 import { assertRewardTransition, isTerminal, nextState } from "./support-state";
 import { computeSettlement, defaultTaskBonus, settlementBreakdown } from "./reward";
-import { checkComment, checkLike, checkSubscription } from "./youtube-api";
+import { checkComment, checkLike, checkSubscription, fetchVideoMetadata } from "./youtube-api";
+import { assertCompliant, recordComplianceObligation } from "./subscription-compliance";
 import { createNotificationTx, deliverNotification } from "./notifications";
 import { campaignAvailabilityFailure } from "./campaign-eligibility";
 import { evaluateBadges } from "./badges";
@@ -83,7 +84,6 @@ const RULE_MESSAGES: Record<string, string> = {
   DAILY_LIMIT: "سقف روزانه این کمپین پر شده است.",
   USER_LIMIT: "سهم شما از این کمپین تکمیل شده است.",
   DUPLICATE_SUPPORT: "قبلاً در این کمپین حمایت کرده‌اید.",
-  ACCOUNT_TOO_NEW: "برای این کمپین حساب شما باید قدیمی‌تر باشد.",
   CREATOR_UNAVAILABLE: "حساب سازنده این کمپین در دسترس نیست.",
   VIDEO_UNAVAILABLE: "ویدیوی این کمپین در دسترس نیست.",
   SESSION_NOT_FOUND: "این نشست حمایت پیدا نشد.",
@@ -95,6 +95,8 @@ const RULE_MESSAGES: Record<string, string> = {
   IMPOSSIBLE_TIMELINE: "زمان سپری‌شده با میزان تماشای گزارش‌شده هم‌خوانی ندارد.",
   REQUIRED_TASK_INCOMPLETE: "همه کارهای الزامی انجام نشده‌اند.",
   RISK_DENIED: "این حمایت به دلیل رفتار مشکوک تأیید نشد.",
+  SUBSCRIPTION_COMPLIANCE_VIOLATED:
+    "برای ادامه فعالیت، باید اشتراک کانال‌هایی که بابت آن‌ها حمایت دریافت کرده‌اید را حفظ کنید. ابتدا دوباره کانال را سابسکرایب کنید و سپس بررسی مجدد را انجام دهید.",
   ALREADY_SUPPORTED_PAIR: "در بازه خنک‌سازی این سازنده هستید.",
 };
 
@@ -133,7 +135,19 @@ async function assertEligible(tx: Tx, input: EligibilityInput) {
     where: { id: input.campaignId },
     include: {
       creator: { select: { id: true, status: true, username: true, name: true, avatarUrl: true } },
-      video: { select: { id: true, status: true, youtubeVideoId: true, durationSec: true, userId: true } },
+      video: {
+        select: {
+          id: true,
+          status: true,
+          youtubeVideoId: true,
+          durationSec: true,
+          userId: true,
+          // The subscribe target, so the flow can NAME the channel to subscribe to
+          // instead of just saying "subscribe".
+          channelId: true,
+          channelTitle: true,
+        },
+      },
       tasks: { orderBy: { sortOrder: "asc" } },
     },
   });
@@ -158,10 +172,22 @@ async function assertEligible(tx: Tx, input: EligibilityInput) {
   });
   if (supporter.status !== "ACTIVE") throw ruleError("CREATOR_UNAVAILABLE");
 
-  if (campaign.minAccountAgeHours > 0) {
-    const ageHours = (now.getTime() - supporter.createdAt.getTime()) / 3_600_000;
-    if (ageHours < campaign.minAccountAgeHours) throw ruleError("ACCOUNT_TOO_NEW");
-  }
+  // NOTE: there is deliberately NO minimum-account-age gate here any more.
+  //
+  // It was a per-campaign hour threshold that refused a support outright, and it
+  // failed in the one way an anti-abuse rule must not: it punished the honest
+  // majority to deter a minority it never actually stopped. A campaign set to 30
+  // hours locked out four of six accounts on the platform — including the creator
+  // who set it, who had no way to see that was the consequence — while anyone
+  // farming supports simply waits, because age is the one requirement that
+  // satisfies itself by doing nothing.
+  //
+  // Age has not stopped being a signal; it stopped being a verdict. It still
+  // feeds the risk score in anti-abuse.ts (ACCOUNT_TOO_NEW, severity 3), where it
+  // combines with evidence that is actually about behaviour — velocity, pair
+  // farming, shared fingerprints, rings. On its own it scores 24 against a review
+  // threshold of 50, so a genuine first support from a new account pays out, and
+  // a new account behaving like a farm still lands in the queue.
 
   // Already completed for this pair+campaign? The unique index is the real
   // guard, this is the friendly early exit.
@@ -218,6 +244,15 @@ export type StartSupportInput = {
 export type StartSupportResult = {
   session: SupportSession;
   video: { id: string; youtubeVideoId: string; durationSec: number | null };
+  /**
+   * The channel the supporter must subscribe to, named explicitly.
+   *
+   * "Subscribe to the channel" is not actionable when the video opens in the
+   * YouTube app and the user has more than one account: they cannot tell which
+   * channel we will check, or on which account. Naming it here is what makes the
+   * subscribe task followable.
+   */
+  targetChannel: { id: string; title: string | null; url: string } | null;
   requiredWatchSeconds: number;
   /** Null until the supporter opens the video; the timer runs from this instant. */
   openedAt: Date | null;
@@ -228,6 +263,16 @@ export type StartSupportResult = {
 };
 
 export async function startSupportSession(input: StartSupportInput): Promise<StartSupportResult> {
+  // Subscription compliance is checked BEFORE the transaction opens, never inside
+  // it. The check can reach YouTube, and this transaction also runs the whole
+  // eligibility pass — holding it open across an 8-second provider timeout would
+  // tie up a pooled connection for the duration. Same sequencing as
+  // verifySessionTasks: talk to the provider first, then write.
+  //
+  // Placed at the very start so a blocked user is refused before any row is
+  // created, and the error they get names the actual reason.
+  await assertCompliant(input.supporterId);
+
   return prisma.$transaction(async (tx) => {
     const { campaign } = await assertEligible(tx, { supporterId: input.supporterId, campaignId: input.campaignId });
 
@@ -312,6 +357,13 @@ export async function startSupportSession(input: StartSupportInput): Promise<Sta
     return {
       session,
       video: { id: video.id, youtubeVideoId: video.youtubeVideoId, durationSec: video.durationSec },
+      targetChannel: video.channelId
+        ? {
+            id: video.channelId,
+            title: video.channelTitle,
+            url: `https://www.youtube.com/channel/${video.channelId}?sub_confirmation=1`,
+          }
+        : null,
       requiredWatchSeconds: requiredSec,
       openedAt,
       remainingSeconds: remainingWatchSeconds(openedAt, requiredSec),
@@ -382,7 +434,7 @@ async function loadLiveSession(tx: Tx, sessionId: string, supporterId: string) {
 export async function openWatchTarget(input: { sessionId: string; supporterId: string }): Promise<WatchTimerResult> {
   return prisma.$transaction(async (tx) => {
     await tx.$queryRaw`
-      SELECT "id" FROM "WatchSession" WHERE "sessionId" = ${input.sessionId} FOR UPDATE
+      SELECT "id" FROM public."WatchSession" WHERE "sessionId" = ${input.sessionId} FOR UPDATE
     `;
     const session = await loadLiveSession(tx, input.sessionId, input.supporterId);
     const watch = session.watchSession!;
@@ -482,6 +534,74 @@ function buildTimerResult(
 /* Task verification                                                          */
 /* ------------------------------------------------------------------------- */
 
+/**
+ * The channel a supporter is asked to subscribe to.
+ *
+ * THIS IS THE CHANNEL THAT OWNS THE VIDEO, and not the creator's own linked
+ * account. The two are usually the same person, but they are not the same fact:
+ *
+ *   - Video ownership is PUBLIC. `videos.list` names the uploading channel, so
+ *     the subscribe target is knowable for every campaign video, with an API key
+ *     and no user grant at all.
+ *   - A creator's OAuth link is OPTIONAL. Reading the target from
+ *     `YoutubeConnection` meant that a creator who had not connected their
+ *     account produced `channelId === null`, the SUBSCRIBE_CHANNEL branch was
+ *     skipped entirely, and the task fell through to the catch-all that reports
+ *     "this task is not configured". Because that verdict is UNAVAILABLE rather
+ *     than a definitive no, and a required task with no definitive answer was
+ *     written down as FAILED, an honest supporter who really had subscribed was
+ *     told they had not — and no amount of re-checking could ever clear it, since
+ *     nothing about re-checking makes the creator connect their account.
+ *
+ * Resolution order, and why:
+ *   1. `Video.channelId`, captured from YouTube when the video was registered.
+ *   2. A lazy one-off lookup for rows created before that column existed, which
+ *      is then persisted so it costs a single unit per video, ever.
+ *
+ * There is no third step. The creator's linked channel used to serve as a
+ * fallback, but it answers a different question — "who registered this campaign?"
+ * — and one production row was already wrong because of it, storing a Tech With
+ * Tim video as if the registering user owned it.
+ *
+ * Returning null means we genuinely cannot name a target right now, which the
+ * caller must report as "could not check" — never as "you did not subscribe".
+ */
+async function resolveTargetChannelId(
+  video: { id: string; youtubeVideoId: string; channelId: string | null } | null
+): Promise<string | null> {
+  if (!video) return null;
+  if (video.channelId) return video.channelId;
+
+  try {
+    const metadata = await fetchVideoMetadata(video.youtubeVideoId);
+    if (metadata?.channelId) {
+      // Persisted, so the next verification reads it from our own row instead of
+      // spending another call — and so the value cannot drift mid-session.
+      await prisma.video.update({
+        where: { id: video.id },
+        data: {
+          channelId: metadata.channelId,
+          channelTitle: metadata.channelTitle,
+          madeForKids: metadata.madeForKids,
+        },
+      });
+      return metadata.channelId;
+    }
+  } catch (e) {
+    logger.warn("could not resolve the owning channel of a campaign video", {
+      videoId: video.id,
+      error: internalMessage(e),
+    });
+  }
+
+  // Deliberately NOT falling back to the creator's linked channel. That fallback is
+  // a guess about ownership, and when it is wrong the supporter is asked to
+  // subscribe to one channel while we inspect another — the exact failure this
+  // function exists to prevent. Returning null makes the caller report "could not
+  // check", which is honest and recoverable, instead of a confident wrong answer.
+  return null;
+}
+
 export type TaskVerification = {
   type: string;
   required: boolean;
@@ -512,8 +632,8 @@ export async function verifySessionTasks(sessionId: string, supporterId: string)
     include: {
       tasks: true,
       watchSession: true,
-      video: { select: { youtubeVideoId: true } },
-      creator: { select: { youtubeConnection: { select: { channelId: true } } } },
+      video: { select: { id: true, youtubeVideoId: true, channelId: true, madeForKids: true } },
+      campaign: { select: { kidsContent: true } },
     },
   });
 
@@ -527,11 +647,126 @@ export async function verifySessionTasks(sessionId: string, supporterId: string)
     await prisma.supportSession.update({ where: { id: session.id }, data: { state: verifying } });
   }
 
-  const channelId = session.creator.youtubeConnection?.channelId ?? null;
+  // The channel to subscribe to is the one that OWNS the video, not the creator's
+  // own linked account. See resolveTargetChannelId() for why that distinction is
+  // the whole bug.
+  const channelId = await resolveTargetChannelId(session.video);
   const videoId = session.video?.youtubeVideoId ?? null;
-  const supporterChannelId = (
-    await prisma.youtubeConnection.findUnique({ where: { userId: supporterId }, select: { channelId: true } })
-  )?.channelId ?? null;
+  /**
+   * The supporter's OWN connected channel.
+   *
+   * Carried into the failure copy on purpose. A "not verified" verdict is only
+   * actionable if the user knows WHICH YouTube account was inspected: with several
+   * Google accounts signed in — the browser on one, the YouTube app on another —
+   * subscribing on the wrong one produces a real subscription that this check can
+   * never see. Saying only "you are not subscribed" sends the user to repeat an
+   * action they already performed, on the same wrong account, forever.
+   */
+  const [supporterConnection, supporterGrant] = await Promise.all([
+    prisma.youtubeConnection.findUnique({
+      where: { userId: supporterId },
+      select: { channelId: true, channelTitle: true },
+    }),
+    prisma.youtubeAccount.findUnique({ where: { userId: supporterId }, select: { googleEmail: true } }),
+  ]);
+  const supporterChannelId = supporterConnection?.channelId ?? null;
+  // The email is preferred over the channel title in failure copy: people recognise
+  // which Google account they are signed into, not which channel it owns.
+  const supporterIdentity = supporterGrant?.googleEmail ?? supporterConnection?.channelTitle ?? null;
+
+  /**
+   * Is YouTube verification waived for this campaign?
+   *
+   * True when the creator declared the campaign as kids content, and also when
+   * YouTube itself reports the video as "Made for Kids" — the second is a fact we
+   * can read, the first covers what we cannot.
+   *
+   * On this content YouTube switches personalisation off. The like provably never
+   * reaches the viewer's own "Liked videos" playlist (a campaign video here has
+   * public likes that appear in nobody's list). Subscriptions to such channels are
+   * reported the same way by creators, and the API cannot refute it: an absent
+   * subscription and one that was never made look identical from the outside.
+   *
+   * So both are waived rather than judged. The earlier remedy — asking the creator
+   * to un-flag their video in YouTube Studio — was wrong: it asked them to
+   * misdeclare kids content to YouTube in order to satisfy our checker.
+   */
+  let verificationWaived = Boolean(session.campaign?.kidsContent || session.video?.madeForKids);
+
+  /**
+   * Last line of defence before telling a supporter they did not do something.
+   *
+   * The waiver above rests on two facts, and BOTH can be false while the campaign is
+   * still kids content:
+   *
+   *   - The creator may simply not have ticked the box. Nothing forces them to, and
+   *     they have no reason to know our checker depends on it.
+   *   - Our stored `Video.madeForKids` is a CACHE, written when the video was
+   *     registered. A creator who flips "Made for Kids" in YouTube Studio afterwards
+   *     — or whose video YouTube reclassifies — leaves that cache stale, and nothing
+   *     in the system re-reads it on its own.
+   *
+   * In both cases the subscribe and like checks would run, find nothing (because
+   * YouTube does not report these actions on kids content), and write FAILED against
+   * a supporter who did exactly what was asked.
+   *
+   * So the premise is re-confirmed from YouTube at the only moment it matters: after
+   * a check has come back "no", and before that "no" is recorded. Costs nothing in
+   * the normal case — it runs only when a failure is imminent, at most once per
+   * verification — and it is self-healing: the fresh flag is persisted and the
+   * campaign is marked as kids content so later sessions skip the lookup entirely.
+   */
+  let waiverRechecked = false;
+  // Bound once: a null-narrowing does not survive into a closure, and re-testing for
+  // null inside would imply it could be null here when it cannot.
+  const checkedSession = session;
+  async function kidsContentConfirmedLate(): Promise<boolean> {
+    if (verificationWaived) return true;
+    // One lookup per verification, even with both subscribe and like failing.
+    if (waiverRechecked) return false;
+    waiverRechecked = true;
+
+    const video = checkedSession.video;
+    if (!video) return false;
+
+    try {
+      const fresh = await fetchVideoMetadata(video.youtubeVideoId);
+      if (!fresh) return false;
+
+      // Persist regardless of the answer: a confirmed "not kids" is worth caching too.
+      await prisma.video.update({
+        where: { id: video.id },
+        data: {
+          madeForKids: fresh.madeForKids,
+          channelId: fresh.channelId,
+          channelTitle: fresh.channelTitle,
+          metadataSyncedAt: new Date(),
+        },
+      });
+
+      if (!fresh.madeForKids) return false;
+
+      // YouTube says kids content and the campaign did not. Record it on the campaign
+      // so every later session is waived up front, and so the creator's own studio
+      // view reflects what YouTube actually reports about their video.
+      await prisma.campaign.update({ where: { id: checkedSession.campaignId }, data: { kidsContent: true } });
+      logger.warn("kids content detected during verification; waiving subscribe/like for the campaign", {
+        campaignId: checkedSession.campaignId,
+        videoId: video.id,
+      });
+
+      verificationWaived = true;
+      return true;
+    } catch (e) {
+      // Unreachable YouTube must not manufacture a failure either. Returning false
+      // leaves the outcome as it was, and an unanswerable check stays PENDING.
+      logger.warn("could not re-confirm the kids-content flag before failing a task", {
+        videoId: video.id,
+        error: internalMessage(e),
+      });
+      return false;
+    }
+  }
 
   const results: TaskVerification[] = [];
 
@@ -541,6 +776,27 @@ export async function verifySessionTasks(sessionId: string, supporterId: string)
     let outcome: TaskVerification["outcome"] = "UNAVAILABLE";
     let note: string | undefined;
     let detail: Record<string, unknown> = {};
+    /**
+     * "Not yet" rather than "no".
+     *
+     * The watch timer is the one check whose negative answer is purely a matter of
+     * waiting: the requirement is not met because the seconds have not passed. That
+     * is not a verdict against the supporter, so it must not be recorded as a
+     * failure the way a completed YouTube check answering "no" is.
+     */
+    let stillRunning = false;
+    /**
+     * "Nobody can answer this", as opposed to "the answer was no".
+     *
+     * Some requirements cannot be verified by anyone with the access we hold — not
+     * now, not after a retry, not with a wider scope. A like on a "Made for Kids"
+     * video is the concrete case: YouTube keeps it out of the viewer's own liked
+     * list, and the one endpoint that would answer directly refuses read-only
+     * tokens. Leaving such a task PENDING would strand the session forever, and
+     * marking it FAILED would accuse a supporter who did exactly what was asked, so
+     * it is WAIVED: recorded as unproven, and not allowed to block settlement.
+     */
+    let unverifiable = false;
 
     if (task.type === "WATCH_VIDEO") {
       const watch = session.watchSession;
@@ -553,6 +809,9 @@ export async function verifySessionTasks(sessionId: string, supporterId: string)
       method = satisfied ? "PLATFORM_OBSERVED" : "UNVERIFIED";
       outcome = satisfied ? "VERIFIED" : "NOT_VERIFIED";
       if (!satisfied && watch) {
+        // Whether the clock is running or has not been started, the next step is to
+        // wait or to open the video — never to be told the task failed.
+        stillRunning = true;
         note = watch.openedAt
           ? `${formatRemaining(remainingWatchSeconds(watch.openedAt, watch.requiredSec))} تا تأیید باقی مانده است.`
           : "ابتدا ویدیو را در یوتیوب باز کنید تا زمان تماشا شروع شود.";
@@ -564,20 +823,76 @@ export async function verifySessionTasks(sessionId: string, supporterId: string)
             openedAt: watch.openedAt?.toISOString() ?? null,
           }
         : {};
-    } else if (task.type === "SUBSCRIBE_CHANNEL" && channelId) {
-      const check = await checkSubscription(supporterId, channelId);
-      satisfied = check.satisfied;
-      method = check.available ? "YOUTUBE_API" : "UNVERIFIED";
-      outcome = check.outcome;
-      note = subscribeNote(check.outcome);
-      detail = check.detail ?? {};
+    } else if (task.type === "SUBSCRIBE_CHANNEL") {
+      if (verificationWaived) {
+        // Waived, not judged. See `verificationWaived`: on kids content YouTube does
+        // not report these actions back to us, so a "no" here would carry no
+        // information — it would just be an accusation we cannot support.
+        outcome = "UNAVAILABLE";
+        method = "UNVERIFIED";
+        unverifiable = true;
+        note = KIDS_CONTENT_NOTE;
+        detail = { reason: "KIDS_CONTENT_VERIFICATION_WAIVED", channelId };
+      } else if (!channelId) {
+        // We could not name the channel to check, so we cannot answer. Reported as
+        // "not checkable right now", never as "you did not subscribe": this branch
+        // used to fall through to the catch-all below and mark a required task
+        // FAILED, which told supporters who really had subscribed that they had not.
+        outcome = "UNAVAILABLE";
+        note = "کانال این ویدیو در دسترس نیست؛ این مورد فعلاً قابل بررسی نبود و ناموفق ثبت نشد. چند لحظه بعد دوباره بررسی کنید.";
+        detail = { reason: "NO_TARGET_CHANNEL" };
+      } else {
+        const check = await checkSubscription(supporterId, channelId);
+        if (check.outcome === "NOT_VERIFIED" && (await kidsContentConfirmedLate())) {
+          // YouTube reports this as kids content after all, so "not found in the
+          // subscription list" is not evidence of anything. Waive instead of accuse.
+          outcome = "UNAVAILABLE";
+          method = "UNVERIFIED";
+          unverifiable = true;
+          note = KIDS_CONTENT_NOTE;
+          detail = { reason: "KIDS_CONTENT_DETECTED_LATE", channelId };
+        } else {
+          satisfied = check.satisfied;
+          method = check.available ? "YOUTUBE_API" : "UNVERIFIED";
+          outcome = check.outcome;
+          note = subscribeNote(check.outcome, supporterIdentity);
+          detail = { ...(check.detail ?? {}), channelId };
+        }
+      }
     } else if (task.type === "LIKE_VIDEO" && videoId) {
-      const check = await checkLike(supporterId, videoId);
-      satisfied = check.satisfied;
-      method = check.available ? "YOUTUBE_API" : "UNVERIFIED";
-      outcome = check.outcome;
-      note = likeNote(check.outcome);
-      detail = check.detail ?? {};
+      if (verificationWaived) {
+        /*
+         * Kids content: the like is NOT verifiable, so we refuse to judge it.
+         *
+         * Proven on this server: a campaign video with public likes that appears in
+         * nobody's "Liked videos" playlist. That playlist is the only like surface a
+         * youtube.readonly grant can read — videos.getRating answers directly but
+         * demands the full read/write youtube scope and returns 403 to a read-only
+         * token, so widening the scope is not a fix either.
+         */
+        outcome = "UNAVAILABLE";
+        method = "UNVERIFIED";
+        unverifiable = true;
+        note = KIDS_CONTENT_NOTE;
+        detail = { reason: "KIDS_CONTENT_VERIFICATION_WAIVED" };
+      } else {
+        const check = await checkLike(supporterId, videoId);
+        if (check.outcome === "NOT_VERIFIED" && (await kidsContentConfirmedLate())) {
+          // Same reasoning as subscribe: on kids content the like never reaches the
+          // viewer's own liked playlist, so its absence proves nothing.
+          outcome = "UNAVAILABLE";
+          method = "UNVERIFIED";
+          unverifiable = true;
+          note = KIDS_CONTENT_NOTE;
+          detail = { reason: "KIDS_CONTENT_DETECTED_LATE" };
+        } else {
+          satisfied = check.satisfied;
+          method = check.available ? "YOUTUBE_API" : "UNVERIFIED";
+          outcome = check.outcome;
+          note = likeNote(check.outcome, supporterIdentity);
+          detail = check.detail ?? {};
+        }
+      }
     } else if (task.type === "COMMENT_VIDEO" && videoId) {
       const check = await checkComment(videoId, supporterChannelId);
       satisfied = check.satisfied;
@@ -589,16 +904,26 @@ export async function verifySessionTasks(sessionId: string, supporterId: string)
       note = "پیکربندی این کار کامل نیست.";
     }
 
-    // A transient upstream failure must not be written down as a definitive
-    // failure: keep the task open so the user can retry.
+    // A check that could not be COMPLETED must never be written down as a
+    // definitive failure. Only NOT_VERIFIED — a finished call whose answer was
+    // "no" — fails a required task. A transient error, a dead grant, or a target we
+    // could not name all leave the task PENDING so re-checking can still clear it;
+    // previously UNAVAILABLE fell into the same bucket as "no", which is how an
+    // unanswerable check became a permanent accusation.
     const nextTaskState =
       satisfied
         ? "SATISFIED"
-        : outcome === "TEMPORARY_ERROR" || outcome === "REAUTH_REQUIRED"
-          ? "PENDING"
-          : task.required
-            ? "FAILED"
-            : "SKIPPED";
+        : unverifiable
+          ? // Waived: unprovable for everyone, so it neither passes nor fails. Kept
+            // out of the settlement gate below instead of blocking it forever.
+            "SKIPPED"
+          : outcome === "NOT_VERIFIED" && !stillRunning
+            ? task.required
+              ? "FAILED"
+              : "SKIPPED"
+            : task.required
+              ? "PENDING"
+              : "SKIPPED";
 
     await prisma.$transaction(async (tx) => {
       await tx.supportTask.update({
@@ -619,11 +944,13 @@ export async function verifySessionTasks(sessionId: string, supporterId: string)
           result:
             satisfied
               ? "PASSED"
-              : outcome === "TEMPORARY_ERROR"
+              : stillRunning
                 ? "PENDING"
                 : outcome === "NOT_VERIFIED"
                   ? "FAILED"
-                  : "INCONCLUSIVE",
+                  : outcome === "TEMPORARY_ERROR"
+                    ? "PENDING"
+                    : "INCONCLUSIVE",
           detail: detail as Prisma.InputJsonValue,
         },
       });
@@ -636,15 +963,34 @@ export async function verifySessionTasks(sessionId: string, supporterId: string)
 }
 
 /**
+ * What a supporter is told when a task is waived as kids content.
+ *
+ * Deliberately blames neither the supporter nor the creator: it is a YouTube
+ * restriction. It also states the consequence honestly — the task is not counted
+ * against them, and it earns no bonus, because nothing was verified.
+ */
+const KIDS_CONTENT_NOTE =
+  "این کمپین به‌عنوان محتوای کودکان (YouTube Kids) ثبت شده است. یوتیوب برای این نوع محتوا سابسکرایب و لایک را به ما گزارش نمی‌دهد، پس این مورد قابل بررسی خودکار نیست؛ ناموفق ثبت نمی‌شود و مانع تکمیل حمایت شما نیست.";
+
+/**
  * Failure copy for subscribe. Specific and actionable, never "something went
  * wrong" and never a raw provider status code.
+ *
+ * A NOT_VERIFIED verdict NAMES THE CHANNEL THAT WAS INSPECTED. The most common
+ * cause of an honest "but I did subscribe!" is not a broken check: it is a second
+ * Google account. The browser is signed into one, the YouTube app into another,
+ * and the subscription lands on an account this grant cannot see. Without the
+ * identity in the message, the only advice the user gets is to repeat the same
+ * action on the same wrong account.
  */
-function subscribeNote(outcome: TaskVerification["outcome"]): string | undefined {
+function subscribeNote(outcome: TaskVerification["outcome"], connectedChannel: string | null): string | undefined {
   switch (outcome) {
     case "VERIFIED":
       return undefined;
     case "NOT_VERIFIED":
-      return "اشتراک این کانال تأیید نشد. کانال را سابسکرایب کنید و دوباره بررسی بزنید.";
+      return connectedChannel
+        ? `ما اشتراک این کانال را در حساب «${connectedChannel}» بررسی کردیم و پیدا نشد. اگر سابسکرایب کرده‌اید، تقریباً همیشه علتش این است که در یوتیوب با یک حساب گوگل دیگر وارد هستید؛ در یوتیوب حساب را به «${connectedChannel}» عوض کنید و همان‌جا سابسکرایب کنید.`
+        : "اشتراک این کانال تأیید نشد. کانال را سابسکرایب کنید و دوباره بررسی بزنید.";
     case "TEMPORARY_ERROR":
       return "یوتیوب در این لحظه پاسخ نداد. این مورد ناموفق ثبت نشد؛ چند لحظه بعد دوباره بررسی کنید.";
     case "REAUTH_REQUIRED":
@@ -654,12 +1000,14 @@ function subscribeNote(outcome: TaskVerification["outcome"]): string | undefined
   }
 }
 
-function likeNote(outcome: TaskVerification["outcome"]): string | undefined {
+function likeNote(outcome: TaskVerification["outcome"], connectedChannel: string | null): string | undefined {
   switch (outcome) {
     case "VERIFIED":
       return undefined;
     case "NOT_VERIFIED":
-      return "این ویدیو در فهرست «ویدیوهای پسندیده» حساب یوتیوب شما پیدا نشد. اگر همین حالا لایک کرده‌اید، چند لحظه صبر کنید و دوباره بررسی بزنید.";
+      return connectedChannel
+        ? `ما لایک این ویدیو را در حساب «${connectedChannel}» بررسی کردیم و پیدا نشد. اگر لایک کرده‌اید، تقریباً همیشه علتش این است که در یوتیوب با یک حساب گوگل دیگر وارد هستید؛ در یوتیوب حساب را به «${connectedChannel}» عوض کنید و لایک را روی همان حساب بزنید.`
+        : "این ویدیو در فهرست «ویدیوهای پسندیده» حساب یوتیوب شما پیدا نشد. اگر همین حالا لایک کرده‌اید، چند لحظه صبر کنید و دوباره بررسی بزنید.";
     case "TEMPORARY_ERROR":
       return "یوتیوب در این لحظه پاسخ نداد. این مورد ناموفق ثبت نشد؛ چند لحظه بعد دوباره بررسی کنید.";
     case "REAUTH_REQUIRED":
@@ -700,6 +1048,13 @@ export async function completeSupportSession(input: {
   sessionId: string;
   supporterId: string;
 }): Promise<CompleteSupportResult> {
+  // Same reasoning as startSupportSession: outside the transaction, because the
+  // settlement transaction is Serializable and must not wait on YouTube.
+  //
+  // Checked here too, not only at start: a session can be started while compliant
+  // and completed an hour later, and settlement is where the money actually moves.
+  await assertCompliant(input.supporterId);
+
   const MAX_ATTEMPTS = 4;
   let lastError: unknown;
 
@@ -773,7 +1128,12 @@ async function runCompletion(input: { sessionId: string; supporterId: string }) 
       const { campaign } = await assertEligible(tx, { supporterId: input.supporterId, campaignId: session.campaignId });
 
       const requiredTasks = session.tasks.filter((task) => task.required);
-      const unmet = requiredTasks.filter((task) => task.state !== "SATISFIED");
+      // SKIPPED on a REQUIRED task means waived: verification was structurally
+      // impossible (see `unverifiable` in verifySessionTasks), so holding the
+      // session hostage to it would strand a supporter who did what was asked. It
+      // still earns no task bonus and still records as unproven, so nothing is
+      // claimed that YouTube did not confirm.
+      const unmet = requiredTasks.filter((task) => task.state !== "SATISFIED" && task.state !== "SKIPPED");
       if (unmet.length > 0) {
         await tx.supportSession.update({
           where: { id: session.id },
@@ -912,7 +1272,7 @@ async function runCompletion(input: { sessionId: string; supporterId: string }) 
       // Budget, lifetime capacity and the UTC-day limit are claimed by one row
       // update. Any later failure rolls all counters back with this transaction.
       const reserved = await tx.$queryRaw<Array<{ id: string }>>`
-        UPDATE "Campaign"
+        UPDATE public."Campaign"
         SET "spentCredits" = "spentCredits" + ${settlement.budgetCost},
             "completedSupports" = "completedSupports" + 1,
             "dailySupports" = CASE
@@ -991,6 +1351,44 @@ async function runCompletion(input: { sessionId: string; supporterId: string }) 
 
       const targetRewardState = combined.decision === "REVIEW" ? "PENDING_REVIEW" : "CONFIRMED";
       assertRewardTransition(session.rewardState, targetRewardState);
+
+      // ---- Subscription obligation ----------------------------------------
+      // Recorded inside the settlement transaction, so an obligation can never be
+      // missing for a support that was paid, nor exist for one that rolled back.
+      //
+      // The channel is read here rather than passed in because the obligation is to
+      // the channel that was actually supported: copying it now means a creator who
+      // later links a different channel cannot silently move or void everyone's
+      // obligation.
+      //
+      // `subscriptionVerified` comes from the task row's own state — SATISFIED with
+      // method YOUTUBE_API is the only combination that means YouTube itself
+      // confirmed it. A PLATFORM_OBSERVED or SELF_REPORTED pass is deliberately not
+      // enough to create an enforceable obligation: it would be unfair to block
+      // someone later over a subscription we never actually verified.
+      const subscribeTask = session.tasks.find((task) => task.type === "SUBSCRIBE_CHANNEL");
+      // The obligation is to the channel that was actually verified, which is the
+      // channel that owns the video — the same target verifySessionTasks used. It is
+      // read from the video row — the same source the verification used — so the
+      // obligation cannot point at a different channel than the one the supporter
+      // was actually asked to subscribe to. The creator's own linked channel is NOT
+      // consulted: it answers "who registered this campaign", which is a different
+      // question and is wrong whenever someone registers a video they do not own.
+      const creatorChannel =
+        subscribeTask && session.videoId
+          ? await tx.video.findUnique({
+              where: { id: session.videoId },
+              select: { channelId: true },
+            })
+          : null;
+
+      await recordComplianceObligation(tx, {
+        userId: input.supporterId,
+        supportId: support.id,
+        targetChannelId: creatorChannel?.channelId ?? null,
+        subscriptionRequired: Boolean(subscribeTask?.required),
+        subscriptionVerified: subscribeTask?.state === "SATISFIED" && subscribeTask.method === "YOUTUBE_API",
+      });
 
       await tx.supportSession.update({
         where: { id: session.id },
@@ -1317,6 +1715,21 @@ export async function resolveHeldReward(input: {
 }) {
   const reason = input.reason?.slice(0, 500) ?? "";
 
+  // A held reward is new credit about to be paid, so it is gated like any other
+  // earning: approving one for a supporter who has since unsubscribed would pay
+  // out precisely the behaviour compliance exists to discourage.
+  //
+  // Only the APPROVE path is gated. A REFUSE must always be able to proceed — it
+  // returns the amount to the campaign budget, and leaving held rewards stuck
+  // because the supporter is non-compliant would penalize the creator instead.
+  if (input.decision === "APPROVE") {
+    const held = await prisma.supportSession.findUnique({
+      where: { id: input.sessionId },
+      select: { supporterId: true },
+    });
+    if (held) await assertCompliant(held.supporterId);
+  }
+
   const result = await prisma.$transaction(async (tx) => {
     const session = await tx.supportSession.findUnique({
       where: { id: input.sessionId },
@@ -1414,7 +1827,7 @@ export async function resolveHeldReward(input: {
       // that was never credited. Clamped so no adjustment can drive it negative.
       if (support.creditsAwarded > 0) {
         await tx.$executeRaw`
-          UPDATE "Campaign"
+          UPDATE public."Campaign"
           SET "spentCredits" = GREATEST(0, "spentCredits" - ${support.creditsAwarded})
           WHERE "id" = ${support.campaignId};
         `;
@@ -1599,7 +2012,7 @@ export async function reverseSupport(input: {
     // elsewhere must never be able to drive `spentCredits` negative.
     if (support.creditsAwarded > 0) {
       await tx.$executeRaw`
-        UPDATE "Campaign"
+        UPDATE public."Campaign"
         SET "spentCredits" = GREATEST(0, "spentCredits" - ${support.creditsAwarded})
         WHERE "id" = ${support.campaignId};
       `;

@@ -209,6 +209,14 @@ describe("campaignCreateSchema", () => {
     expect(ok(campaignCreateSchema, { ...base, rewardXp: 9999 })).toBe(false);
   });
 
+  it("ignores a client-supplied minimum account age", () => {
+    // The account-age gate was removed: new members may support immediately, and
+    // age is now only a risk signal. The field is stripped rather than validated so
+    // a stale client cannot reinstate the requirement.
+    const parsed = campaignCreateSchema.parse({ ...base, minAccountAgeHours: 720 });
+    expect("minAccountAgeHours" in parsed).toBe(false);
+  });
+
   it("ignores a client-supplied watch requirement", () => {
     // The watch requirement is a platform constant. A campaign that could ask for
     // 50% would buy the same support for half the watching, so the field is

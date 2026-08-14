@@ -31,6 +31,8 @@ type Video = {
   durationSec: number | null;
   status: string;
   metadataSyncedAt: string | null;
+  /** YouTube's kids classification, from the video or its channel. */
+  madeForKids: boolean | null;
   _count: { supports: number; campaigns: number };
 };
 
@@ -293,6 +295,9 @@ export function StudioView() {
       <AddVideoModal open={videoModal} onClose={() => setVideoModal(false)} onDone={load} />
       <CreateCampaignModal
         videoId={campaignModal}
+        // Passed so the kids switch starts in the state YouTube already reports,
+        // rather than defaulting to off and quietly breaking verification.
+        videoMadeForKids={videos.find((v) => v.id === campaignModal)?.madeForKids === true}
         open={campaignModal !== null}
         onClose={() => setCampaignModal(null)}
         onDone={load}
@@ -363,11 +368,14 @@ function AddVideoModal({ open, onClose, onDone }: { open: boolean; onClose: () =
 
 function CreateCampaignModal({
   videoId,
+  videoMadeForKids,
   open,
   onClose,
   onDone,
 }: {
   videoId: string | null;
+  /** What YouTube reports about this video, used to pre-tick the kids switch. */
+  videoMadeForKids: boolean;
   open: boolean;
   onClose: () => void;
   onDone: () => void;
@@ -380,6 +388,20 @@ function CreateCampaignModal({
   const [requireLike, setRequireLike] = useState(true);
   const [askComment, setAskComment] = useState(false);
   const [commentBonusXp, setCommentBonusXp] = useState(5);
+  /**
+   * Creator declaration that this is kids content.
+   *
+   * YouTube does not report subscribes and likes on kids content back to a
+   * read-only API client, so those tasks cannot be verified for this campaign. The
+   * switch waives them instead of failing supporters who really did them.
+   */
+  const [kidsContent, setKidsContent] = useState(videoMadeForKids);
+
+  // The modal is mounted once and reused for each video, so the prefill has to
+  // follow the selection rather than only the first render.
+  useEffect(() => {
+    setKidsContent(videoMadeForKids);
+  }, [videoMadeForKids, videoId]);
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -414,7 +436,9 @@ function CreateCampaignModal({
         budgetCredits: Number(form.get("budgetCredits")),
         maxSupportsPerUser: 1,
         dailyLimit: Number(form.get("dailyLimit") ?? 100),
-        minAccountAgeHours: Number(form.get("minAccountAgeHours") ?? 0),
+        // No minAccountAgeHours: the account-age requirement is gone, so there is
+        // no field to send and nothing to configure for it below.
+        kidsContent,
         tasks,
       });
       toast.push({ tone: "success", message: "کمپین ساخته شد و در کاوش نمایش داده می‌شود." });
@@ -484,14 +508,18 @@ function CreateCampaignModal({
             <Input id="days" name="days" type="number" min={1} max={365} defaultValue={30} dir="ltr" className="latin" />
           </Field>
 
-          <Field
-            label="حداقل سن حساب (ساعت)"
-            htmlFor="minAccountAgeHours"
-            hint="برای کاهش سوءاستفاده حساب‌های تازه"
-            error={fields.minAccountAgeHours}
-          >
-            <Input id="minAccountAgeHours" name="minAccountAgeHours" type="number" min={0} max={720} defaultValue={0} dir="ltr" className="latin" />
-          </Field>
+          {/*
+            A "minimum account age" input used to sit here, and is deliberately gone.
+            It read like a mild anti-abuse knob but acted as a hard refusal: a creator
+            who typed 30 locked out most of the platform — themselves included — with
+            nothing on screen saying that was the consequence. Account age still feeds
+            the risk score, where it is weighed against real behaviour instead of
+            deciding on its own.
+          */}
+          <div className="rounded-lg bg-surface-sunken p-3 text-xs leading-6 text-fg-muted">
+            همه حساب‌ها می‌توانند از این کمپین حمایت کنند و حساب‌های تازه محدودیتی ندارند. رفتار مشکوک همچنان توسط سامانه
+            ضدسوءاستفاده بررسی می‌شود.
+          </div>
         </div>
 
         <div className="space-y-3 rounded-lg border border-border p-3">
@@ -500,9 +528,53 @@ function CreateCampaignModal({
             تماشا همیشه الزامی است. سابسکرایب و لایک فقط برای حامیانی قابل تأیید است که حساب یوتیوب خود را متصل کرده‌اند. اعتبار هر حمایت
             برای همه کمپین‌ها یکسان و ثابت است؛ کار اختیاری فقط XP اضافه می‌کند.
           </p>
-          <Switch checked={requireSubscribe} onChange={setRequireSubscribe} label="سابسکرایب کانال" description="با API رسمی یوتیوب بررسی می‌شود." />
-          <Switch checked={requireLike} onChange={setRequireLike} label="لایک ویدیو" description="با API رسمی یوتیوب بررسی می‌شود." />
+          <Switch
+            checked={requireSubscribe}
+            onChange={setRequireSubscribe}
+            label="سابسکرایب کانال"
+            description={kidsContent ? "به دلیل محتوای کودکان، بدون بررسی خودکار پذیرفته می‌شود." : "با API رسمی یوتیوب بررسی می‌شود."}
+          />
+          <Switch
+            checked={requireLike}
+            onChange={setRequireLike}
+            label="لایک ویدیو"
+            description={kidsContent ? "به دلیل محتوای کودکان، بدون بررسی خودکار پذیرفته می‌شود." : "با API رسمی یوتیوب بررسی می‌شود."}
+          />
           <Switch checked={askComment} onChange={setAskComment} label="کامنت (اختیاری)" description="عدم انجام آن مانع تکمیل حمایت نمی‌شود." />
+
+          {/*
+            The kids-content declaration.
+
+            A creator switch rather than an automatic detection: YouTube does not
+            report subscribes and likes on kids content back to a read-only client,
+            and an absent subscription is indistinguishable from one that was never
+            made. The alternative — demanding the creator un-flag their video in
+            YouTube Studio — asked them to misdeclare kids content to YouTube just to
+            satisfy our checker, which is not ours to require.
+          */}
+          <div className="rounded-lg bg-surface-sunken p-3">
+            <Switch
+              checked={kidsContent}
+              onChange={setKidsContent}
+              label="محتوای کودکان (YouTube Kids)"
+              description={
+                videoMadeForKids
+                  ? "یوتیوب این ویدیو را «ساخته‌شده برای کودکان» گزارش کرده است، پس این گزینه لازم است و خودکار فعال شده."
+                  : "اگر ویدیو در یوتیوب با گزینه «ساخته‌شده برای کودکان» منتشر شده است، این را فعال کنید."
+              }
+              // Not a free choice when YouTube already says so: turning it off would
+              // only produce failed tasks for supporters who did the work. The server
+              // forces it on regardless, so a toggle here would be a lie.
+              disabled={videoMadeForKids}
+            />
+            {kidsContent && (
+              <Alert tone="warning" className="mt-3">
+                با فعال بودن این گزینه، سابسکرایب و لایک <span className="font-bold">بررسی خودکار نمی‌شوند</span> و به‌صورت «تأییدنشده»
+                رد می‌شوند؛ یوتیوب این دو مورد را برای محتوای کودکان به ما گزارش نمی‌دهد. حامی به‌خاطر آن‌ها ناموفق نمی‌شود، ولی شما هم
+                مدرکی برای انجام‌شدنشان نخواهید داشت. تماشا مثل همیشه با ساعت سرور سنجیده می‌شود.
+              </Alert>
+            )}
+          </div>
 
           {askComment && (
             <Field

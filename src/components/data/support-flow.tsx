@@ -1,13 +1,14 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { CheckCircle2, ExternalLink, Link2, PlayCircle, RefreshCw, ShieldAlert, TrendingUp } from "lucide-react";
+import { CheckCircle2, ExternalLink, Link2, PlayCircle, RefreshCw, ShieldAlert, TrendingUp, Youtube } from "lucide-react";
 import { api, errorMessage } from "@/lib/client-api";
 import { Modal } from "@/components/ui/modal";
 import { Button } from "@/components/ui/button";
 import { Alert } from "@/components/ui/states";
 import { ProgressBar, Steps, type Step } from "@/components/ui/progress";
 import { Pill, VerificationBadge } from "@/components/ui/badge";
+import { ComplianceBanner } from "./compliance-banner";
 import { formatDuration, formatNumber } from "@/lib/cn";
 import { SUPPORT_TRANSFER_CREDITS } from "@/lib/gamification";
 import { youtubeAppUrl } from "@/lib/youtube";
@@ -57,6 +58,10 @@ type SessionInfo = {
   state: string;
   expiresAt: string;
   video: { id: string; youtubeVideoId: string; durationSec: number | null; watchUrl: string };
+  /** The channel to subscribe to, named, with a one-click subscribe link. */
+  targetChannel: { id: string; title: string | null; url: string } | null;
+  /** True when YouTube's kids restrictions make subscribe and like unverifiable. */
+  kidsContentWaiver?: boolean;
   requiredWatchSeconds: number;
   openedAt: string | null;
   remainingSeconds: number;
@@ -64,6 +69,8 @@ type SessionInfo = {
   tasks: { type: string; required: boolean; rewardXp: number; verifiable: string }[];
   youtubeConnected: boolean;
   youtubeState?: string;
+  /** The YouTube identity the subscribe/like checks will inspect. */
+  connectedChannel: { id: string; title: string | null; email?: string | null } | null;
 };
 
 /** Server's view of the watch timer. Every field here is computed server-side. */
@@ -171,6 +178,15 @@ export function SupportFlow({
   const [verifying, setVerifying] = useState(false);
   const [completion, setCompletion] = useState<Completion | null>(null);
   const [completing, setCompleting] = useState(false);
+  /**
+   * Bumped to re-run the start effect.
+   *
+   * A counter rather than calling the start logic directly: the session request
+   * lives inside an effect with its own cancellation, so re-triggering the effect
+   * reuses that teardown instead of introducing a second, racier start path.
+   */
+  const [startNonce, setStartNonce] = useState(0);
+  const restart = useCallback(() => setStartNonce((n) => n + 1), []);
 
   const tickRef = useRef<number | null>(null);
 
@@ -216,7 +232,7 @@ export function SupportFlow({
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, campaignId]);
+  }, [open, campaignId, startNonce]);
 
   // Cosmetic countdown. It never decides anything — when it reaches zero the
   // server is asked, and the server's answer replaces whatever this showed.
@@ -358,9 +374,12 @@ export function SupportFlow({
         const isWatch = task.type === "WATCH_VIDEO";
         const satisfied = isWatch ? watchSatisfied : Boolean(result?.satisfied);
 
-        // A temporary upstream failure is "still pending", not "failed" — the
-        // server keeps the task open, and the UI must say the same thing.
-        const pending = result?.outcome === "TEMPORARY_ERROR" || result?.outcome === "REAUTH_REQUIRED";
+        // Only a COMPLETED check whose answer was "no" is a failure. Anything the
+        // server could not actually ask — a YouTube outage, a dead grant, or a
+        // target it could not name — is still pending, and the server keeps the
+        // task open for exactly that reason. Showing those as "failed" told users
+        // they had not done something we never managed to check.
+        const pending = Boolean(result) && result?.outcome !== "NOT_VERIFIED";
 
         const state: Step["state"] = satisfied
           ? "completed"
@@ -420,6 +439,19 @@ export function SupportFlow({
         )
       }
     >
+      {/*
+        Compliance first. A violated user is refused by the server the moment they
+        open this flow, so the banner explains WHY the session failed to start and
+        offers the way out, instead of leaving a bare rule error on screen. Renders
+        nothing when the user is compliant, and costs no YouTube quota to show.
+
+        onRestored re-runs the flow: once the gate lifts, the session the user
+        originally asked for can actually be created.
+      */}
+      <div className="mb-4">
+        <ComplianceBanner onRestored={restart} />
+      </div>
+
       {error && (
         <Alert tone="danger" live="alert" className="mb-4">
           {error}
@@ -486,7 +518,10 @@ export function SupportFlow({
               </span>
             </div>
 
-            {reauthNeeded ? (
+            {/* Both connection prompts are about enabling API verification, so they
+                are silent when this campaign waives it: asking someone to reconnect
+                for a check that will not run is noise. */}
+            {session.kidsContentWaiver ? null : reauthNeeded ? (
               <Alert tone="warning" title="اتصال یوتیوب باید تازه شود">
                 دسترسی حساب یوتیوب شما منقضی یا لغو شده است، بنابراین سابسکرایب و لایک قابل بررسی نیستند. تا زمانی که دوباره متصل نشوید، این
                 کارها را «انجام‌شده» ثبت نمی‌کنیم.
@@ -506,6 +541,61 @@ export function SupportFlow({
               )
             )}
 
+            {/*
+              A limitation of YouTube, stated before the supporter acts rather than
+              surfaced afterwards as a failed task. On kids content the like never
+              reaches the viewer's own liked list, and subscriptions are reported the
+              same way, so no read-only check can confirm either. Saying so is the
+              honest move; blaming the supporter is not.
+            */}
+            {session.kidsContentWaiver && (
+              <Alert tone="warning" title="سابسکرایب و لایک این کمپین بررسی خودکار نمی‌شوند">
+                این کمپین محتوای کودکان (YouTube Kids) است و یوتیوب سابسکرایب و لایک چنین محتوایی را به ما گزارش نمی‌دهد. پس این دو مورد
+                بدون بررسی رد می‌شوند: ناموفق ثبت نمی‌شوند و مانع تکمیل حمایت شما نیستند. لطفاً همچنان انجامشان دهید — سازنده به آن‌ها
+                نیاز دارد، فقط ما راهی برای دیدنشان نداریم. تماشا مثل همیشه سنجیده می‌شود.
+              </Alert>
+            )}
+            {/*
+              WHICH ACCOUNT, AND WHICH CHANNEL.
+
+              The single most common cause of "but I did subscribe!" is not a broken
+              check: it is a second Google account. The video opens in the YouTube
+              app, which may be signed into a different account than the browser, so
+              the subscribe and the like land somewhere this grant cannot see. Naming
+              both sides — the identity we will inspect, and the channel to subscribe
+              to — is what makes the task followable instead of a guess.
+            */}
+            {session.targetChannel && (
+              <div className="space-y-2 rounded-lg border border-border p-3 text-xs">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="text-fg-muted">کانالی که باید سابسکرایب کنید:</span>
+                  <a
+                    href={session.targetChannel.url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center gap-1 font-bold text-accent"
+                  >
+                    <Youtube aria-hidden size={13} /> {session.targetChannel.title ?? session.targetChannel.id}
+                  </a>
+                </div>
+                {session.connectedChannel && (
+                  /* The email leads, the channel follows: users know which Google
+                     account they are signed into, not which channel it owns. */
+                  <p className="leading-6 text-fg-subtle">
+                    بررسی روی حساب گوگل{" "}
+                    <span className="font-bold text-fg">
+                      «{session.connectedChannel.email ?? session.connectedChannel.title ?? session.connectedChannel.id}»
+                    </span>{" "}
+                    انجام می‌شود — همان حسابی که به سایت متصل کرده‌اید
+                    {session.connectedChannel.email && session.connectedChannel.title
+                      ? ` (کانال «${session.connectedChannel.title}»)`
+                      : ""}
+                    . اگر در اپ یوتیوب با حساب دیگری وارد هستید، سابسکرایب و لایک روی آن حساب ثبت می‌شود و ما اجازه دیدنش را نداریم؛ پس اول در
+                    یوتیوب به همین حساب سوئیچ کنید.
+                  </p>
+                )}
+              </div>
+            )}
             {/* aria-live so a screen-reader user hears each verification result
                 as it lands, instead of having to re-read the list. */}
             <div role="status" aria-live="polite">
@@ -527,14 +617,28 @@ export function SupportFlow({
               بنابراین این مورد «ثبت‌شده توسط پلتفرم» است و نه «تأییدشده توسط یوتیوب».
             </p>
 
-            <a
-              href={session.video.watchUrl}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="inline-flex items-center gap-1 text-xs font-semibold text-accent"
-            >
-              <ExternalLink aria-hidden size={13} /> باز کردن در یوتیوب برای سابسکرایب و لایک
-            </a>
+            <div className="flex flex-wrap items-center gap-4">
+              <a
+                href={session.video.watchUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-1 text-xs font-semibold text-accent"
+              >
+                <ExternalLink aria-hidden size={13} /> باز کردن ویدیو در یوتیوب برای لایک
+              </a>
+              {session.targetChannel && (
+                /* sub_confirmation=1 opens YouTube with the subscribe dialog already
+                   raised, so the user cannot subscribe to the wrong channel by mistake. */
+                <a
+                  href={session.targetChannel.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center gap-1 text-xs font-semibold text-accent"
+                >
+                  <Youtube aria-hidden size={13} /> رفتن به کانال برای سابسکرایب
+                </a>
+              )}
+            </div>
           </div>
         )
       )}

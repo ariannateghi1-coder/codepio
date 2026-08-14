@@ -29,6 +29,9 @@ export default function LoginPage() {
         <LoginForm />
       </Suspense>
       <div className="mt-5 text-center">
+        <Link href="/auth/forgot-password" className="text-sm font-semibold text-fg-muted hover:text-accent">
+          رمز عبور را فراموش کرده‌اید؟
+        </Link>
       </div>
     </AuthShell>
   );

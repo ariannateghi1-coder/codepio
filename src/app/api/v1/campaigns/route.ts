@@ -88,7 +88,7 @@ export const POST = active(
     // watch verification is meaningless without a real duration from the API.
     const video = await prisma.video.findFirst({
       where: { id: data.videoId, userId: user.id, status: "ACTIVE" },
-      select: { id: true, durationSec: true },
+      select: { id: true, durationSec: true, madeForKids: true },
     });
     if (!video) throw new NotFoundError("این ویدیو در حساب شما پیدا نشد.");
     if (!video.durationSec) {
@@ -119,7 +119,14 @@ export const POST = active(
           maxTotalSupports: data.maxTotalSupports ?? null,
           maxSupportsPerUser: data.maxSupportsPerUser ?? null,
           dailyLimit: data.dailyLimit ?? null,
-          minAccountAgeHours: data.minAccountAgeHours,
+          // minAccountAgeHours is intentionally not set: a newly registered account
+          // may support immediately. Account age stays a risk SIGNAL in anti-abuse,
+          // never an admission gate. The column keeps its 0 default.
+          // Declared by the creator, and forced on when YouTube itself reports the
+          // video as kids content: there the like is provably unverifiable, so
+          // running without the waiver would keep failing honest supporters no
+          // matter what the creator ticked.
+          kidsContent: data.kidsContent || video.madeForKids === true,
           tasks: {
             create: data.tasks.map((task, index) => ({
               type: task.type,
@@ -218,7 +225,7 @@ export const PATCH = active(
     const updated = await prisma.$transaction(async (tx) => {
       const lockedRows = await tx.$queryRaw<Array<{ budgetCredits: number; spentCredits: number; status: string }>>`
         SELECT "budgetCredits", "spentCredits", "status"
-        FROM "Campaign"
+        FROM public."Campaign"
         WHERE "id" = ${campaign.id} AND "creatorId" = ${user.id}
         FOR UPDATE
       `;

@@ -97,6 +97,31 @@ export const loginSchema = z.object({
   password: z.string().min(1).max(200),
 });
 
+export const forgotPasswordSchema = z.object({
+  email: emailSchema,
+});
+
+/**
+ * Reset submission.
+ *
+ * The token is bounded but otherwise unvalidated in shape: it is compared against
+ * a stored hash, so a malformed value simply fails to match. Rejecting it on
+ * format here would only add a second, differently-timed failure path.
+ *
+ * The new password goes through the same passwordSchema as registration — a reset
+ * must not be a way to set a weaker password than signup allows.
+ */
+export const resetPasswordSchema = z
+  .object({
+    token: z.string().trim().min(20).max(200),
+    password: passwordSchema,
+    confirmPassword: z.string(),
+  })
+  .refine((v) => v.password === v.confirmPassword, {
+    path: ["confirmPassword"],
+    message: "تکرار رمز عبور مطابقت ندارد.",
+  });
+
 export const changePasswordSchema = z
   .object({
     currentPassword: z.string().min(1).max(200),
@@ -170,7 +195,25 @@ export const campaignCreateSchema = z
     maxTotalSupports: z.coerce.number().int().min(1).max(100_000).optional().nullable(),
     maxSupportsPerUser: z.coerce.number().int().min(1).max(100).optional().nullable(),
     dailyLimit: z.coerce.number().int().min(1).max(10_000).optional().nullable(),
-    minAccountAgeHours: z.coerce.number().int().min(0).max(720).default(0),
+    /**
+     * REMOVED: minAccountAgeHours.
+     *
+     * The field is gone from the API surface rather than merely defaulted to 0, so
+     * an old client cannot reintroduce the gate. Because the object is not strict,
+     * a stale client still sending it is simply ignored instead of erroring — the
+     * campaign is created without an age requirement, which is the intended
+     * behaviour now. The column stays in the schema for historical campaigns; no
+     * code reads it to decide anything.
+     */
+    /**
+     * Creator declaration: this is kids content, so subscribe and like cannot be
+     * verified through the YouTube API and are waived instead of failed.
+     *
+     * Accepted from the client — unlike reward or watch settings — because it only
+     * ever WEAKENS the evidence the creator gets for their own budget. There is no
+     * incentive to set it falsely and no way to use it against a supporter.
+     */
+    kidsContent: z.coerce.boolean().default(false),
     tasks: z
       .array(
         z.object({
